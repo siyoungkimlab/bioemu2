@@ -32,9 +32,17 @@ bioemu2 sample-equilibrium \
 
 The command computes an MSA, downloads the default `bioemu2-preview` checkpoint,
 and writes all sixty-four conformations to `outputs/adk/samples.xtc` with
-their topology in `outputs/adk/topology.cif`. It also writes the resolved
+their topology in `outputs/adk/topology.mae`, the first conformation as a
+Maestro structure with bond orders and formal charges. It also writes the resolved
 system and command to the output directory. The first run requires network
 access for the RCSB structure, MSA search, and checkpoint download.
+
+Add `--mae` to also write `outputs/adk/samples.mae`, a Maestro file with one
+structure per sample. Like `topology.mae` and unlike XTC, it carries every bond's
+order and every atom's formal charge, so a sample can go to structure
+preparation or MD without re-perceiving the ligand. Maestro, PyMOL, and boonza
+read it as a list of structures. The flag is also available for
+`sample-equilibrium` and `propagate`.
 
 The `predict-structure` and `sample-equilibrium` commands write
 `physicality.json` with one entry per XTC frame: zero-based `frame`, `status`
@@ -335,13 +343,16 @@ print(output_path)
 ```
 
 The trajectory already carries the system topology, so no separate topology
-argument is needed. `save_frames()` writes `samples.xtc` and `topology.cif`.
+argument is needed. `save_frames()` writes `samples.xtc` and `topology.mae`,
+`samples.mae` too with `mae=True`, and `topology.cif` with `cif=True`. To write MAE with the bond orders and
+formal charges of the system's structure rather than the topology's, call
+`save_mae(samples, path, structure=AllAtomStructure.from_system(system))`.
 The session returns all frames without writing files. Physicality checking
 and saving are separate operations; no frames are removed automatically.
 
 ### Read residue names in saved topology files
 
-In a saved `topology.cif`, single-residue ligands with recognized CCD
+In a saved `topology.mae` or `topology.cif`, single-residue ligands with recognized CCD
 labels retain their codes (for example, `ZN`); unknown or non-CCD labels use
 `LIG`. Multi-residue non-polymer chains retain their per-residue CCD labels.
 When mapping that CIF back to the same `System` with `map_cif_atom_order()`,

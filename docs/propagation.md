@@ -35,6 +35,7 @@ First sample a starting conformation for adenylate kinase (PDB 1AKE):
 bioemu2 sample-equilibrium \
   --pdb-id 1AKE \
   --num-samples 1 \
+  --cif \
   --out outputs/adk-start
 ```
 
@@ -77,8 +78,10 @@ frames in an XTC file and pass `--x0-xtc starts.xtc` instead of
 atom order must match.
 
 The CLI writes `samples.xtc` with endpoints in input order, without the
-starting frames; load it with the output `topology.cif`. When the starting
-structure comes from `sample-equilibrium`, its `topology.cif` contains the
+starting frames; pass `--cif` and load it with the output `topology.cif`
+(the default topology file is `topology.mae`, which MDTraj does not read).
+When the starting structure comes from `sample-equilibrium --cif`, its
+`topology.cif` contains the
 coordinates of frame 0 in the starting `samples.xtc`, whether or not that
 frame passed physicality checks.
 `physicality.json` has one entry per endpoint, in the
@@ -105,8 +108,8 @@ x_tau = emu.propagate(x0, lag_time_ns=1.0)
 save_frames(x_tau, Path("outputs/adk-endpoint"))
 ```
 
-`save_frames()` writes `samples.xtc` and `topology.cif` to the output
-directory. To use `EmuSession.propagate()` with a structure from a CIF file,
+`save_frames()` writes `samples.xtc` and `topology.mae` to the output
+directory, and `topology.cif` too with `cif=True`. To use `EmuSession.propagate()` with a structure from a CIF file,
 such as one downloaded from the PDB, see
 [use an external starting structure](#use-an-external-starting-structure).
 To change how endpoints are sampled, see

@@ -35,6 +35,7 @@ from bioemu2.structure import (
     BatchAllAtomStructure,
     get_asym_id_to_chain_metadata,
 )
+from bioemu2.mae import save_mae
 from bioemu2.structure.cif import save_structure_to_cif
 from bioemu2.structure.preparation import prepare_sampling_inputs
 from bioemu2.trajectory_io import coords_angstrom_to_trajectory
@@ -381,6 +382,8 @@ def _embed_and_sample(
     partial_dir: Path | None,
     output_dir: str | Path | None,
     physicality_mode: PhysicalityFilterMode | str,
+    mae: bool = False,
+    cif: bool = False,
 ) -> mdtraj.Trajectory:
     physicality_mode = normalize_physicality_mode(physicality_mode)
     configured_sampler = sampler_from_preset(
@@ -411,6 +414,8 @@ def _embed_and_sample(
             contacts=contacts,
             out=out,
             physicality_filter=physicality_mode,
+            mae=mae,
+            cif=cif,
         )
         if managed_partial_dir is not None:
             shutil.rmtree(managed_partial_dir)
@@ -432,6 +437,8 @@ def predict_structure(
     partial_dir: Path | None = None,
     output_dir: str | Path | None = None,
     physicality_mode: PhysicalityFilterMode | str = PhysicalityFilterMode.HIGH_QUALITY,
+    mae: bool = False,
+    cif: bool = False,
 ) -> mdtraj.Trajectory:
     """Predict structures with a loaded model and automatically computed MSA.
 
@@ -458,6 +465,10 @@ def predict_structure(
             Reuse only with identical inputs and settings and one writer.
         physicality_mode: Check thresholds for saved outputs; no frames are removed.
             Without output_dir, no checks are run and no final outputs are written.
+        mae: Also write ``samples.mae`` to output_dir, one structure per sample
+            with bond orders and formal charges; see :func:`bioemu2.save_mae`.
+        cif: Also write ``topology.cif`` to output_dir, the first sample as CIF,
+            for MDTraj and ``propagate``. ``topology.mae`` is always written.
 
     Returns:
         Predicted structures as an MDTraj trajectory in nanometers.
@@ -477,6 +488,8 @@ def predict_structure(
         partial_dir=partial_dir,
         output_dir=output_dir,
         physicality_mode=physicality_mode,
+        mae=mae,
+        cif=cif,
     )
 
 
@@ -495,6 +508,8 @@ def sample_equilibrium(
     partial_dir: Path | None = None,
     output_dir: str | Path | None = None,
     physicality_mode: PhysicalityFilterMode | str = PhysicalityFilterMode.HIGH_QUALITY,
+    mae: bool = False,
+    cif: bool = False,
 ) -> mdtraj.Trajectory:
     """Sample equilibrium conformations with a loaded model and automatically computed MSA.
 
@@ -521,6 +536,10 @@ def sample_equilibrium(
             Reuse only with identical inputs and settings and one writer.
         physicality_mode: Check thresholds for saved outputs; no frames are removed.
             Without output_dir, no checks are run and no final outputs are written.
+        mae: Also write ``samples.mae`` to output_dir, one structure per sample
+            with bond orders and formal charges; see :func:`bioemu2.save_mae`.
+        cif: Also write ``topology.cif`` to output_dir, the first sample as CIF,
+            for MDTraj and ``propagate``. ``topology.mae`` is always written.
 
     Returns:
         Equilibrium conformations as an MDTraj trajectory in nanometers.
@@ -540,6 +559,8 @@ def sample_equilibrium(
         partial_dir=partial_dir,
         output_dir=output_dir,
         physicality_mode=physicality_mode,
+        mae=mae,
+        cif=cif,
     )
 
 
@@ -571,16 +592,27 @@ def write_sampling_output(
     contacts: list[Contact] | None,
     out: Path,
     physicality_filter: PhysicalityFilterMode,
+    mae: bool = False,
+    cif: bool = False,
 ) -> Path:
-    """Write all frames and their physicality results in original order."""
+    """Write all frames and their physicality results in original order.
+
+    The topology is ``topology.mae``: the first frame with the structure's bond
+    orders and formal charges. With ``mae``, ``samples.mae`` holds every frame
+    the same way; with ``cif``, ``topology.cif`` is written too.
+    """
     structure = AllAtomStructure.from_system(system, mode=mode, contacts=contacts)
     report = check_physicality(
         trajectory,
         physicality_filter,
         expected_extra_bonds=expected_extra_bonds_from_system(system, trajectory.topology),
     )
-    save_topology_cif(structure, system, trajectory.xyz[0] * 10.0, out / "topology.cif")
+    save_mae(trajectory[0], out / "topology.mae", structure=structure, titles=["topology"])
+    if cif:
+        save_topology_cif(structure, system, trajectory.xyz[0] * 10.0, out / "topology.cif")
     trajectory.save_xtc(str(out / "samples.xtc"))
+    if mae:
+        save_mae(trajectory, out / "samples.mae", structure=structure)
     report.save(out / "physicality.json")
     failed = len(trajectory) - int(report.passed.sum())
     if failed:

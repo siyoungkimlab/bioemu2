@@ -23,6 +23,7 @@ from bioemu2.context_parallel import api as cp_api
 from bioemu2.data_interface import Contact, System, convert_boltz, load_system_and_contacts
 from bioemu2.denoising.samplers import Sampler
 from bioemu2.denoising.steering.potentials import Potential
+from bioemu2.mae import save_mae
 from bioemu2.model import load_model
 from bioemu2.msa.alignment import get_msa
 from bioemu2.physicality import PhysicalityFilterMode, PhysicalityReport
@@ -112,7 +113,7 @@ def _common_options(function: Callable) -> Callable:
             required=True,
             type=click.Path(path_type=Path, file_okay=False),
             metavar="DIR",
-            help="Directory for generated trajectories, topology.cif, system.yaml, and "
+            help="Directory for generated trajectories, topology.mae, system.yaml, and "
             "command.txt. It is created if it does not exist; command output files from an "
             "earlier run may be overwritten.",
         ),
@@ -148,6 +149,20 @@ def _common_options(function: Callable) -> Callable:
             metavar="YAML",
             help="Path to a YAML file containing a top-level 'potentials' list. This replaces "
             "the default physicality potentials and requires edm_gd, edm_fk, or edm_fkc.",
+        ),
+        click.option(
+            "--mae",
+            is_flag=True,
+            help="Also write samples.mae: one structure per sample with every bond's order "
+            "and every atom's formal charge, for preparation and viewing in Maestro, PyMOL "
+            "or boonza. samples.xtc and topology.mae are written as usual.",
+        ),
+        click.option(
+            "--cif",
+            is_flag=True,
+            help="Also write topology.cif, the topology as CIF, which MDTraj reads as the "
+            "topology of samples.xtc and propagate takes as --x0-cif. The topology is "
+            "always written as topology.mae.",
         ),
         click.option(
             "--physicality-filter",
@@ -248,6 +263,8 @@ def _write_propagation_output(
     endpoints: mdtraj.Trajectory,
     contacts: list[Contact] | None = None,
     physicality_filter: PhysicalityFilterMode = PhysicalityFilterMode.HIGH_QUALITY,
+    mae: bool = False,
+    cif: bool = False,
 ) -> Path:
     """Write every sampled endpoint to ``samples.xtc`` in input-frame order.
 
@@ -257,7 +274,9 @@ def _write_propagation_output(
     """
     write_sampling_system(system, mode="equilibrium", contacts=contacts, out=out)
     structure = AllAtomStructure.from_system(system, mode="equilibrium", contacts=contacts)
-    save_topology_cif(structure, system, x0.xyz[0] * 10.0, out / "topology.cif")
+    save_mae(x0[0], out / "topology.mae", structure=structure, titles=["topology"])
+    if cif:
+        save_topology_cif(structure, system, x0.xyz[0] * 10.0, out / "topology.cif")
     expected_extra_bonds = expected_extra_bonds_from_system(system, endpoints.topology)
     passes_checks = np.empty(endpoints.n_frames, dtype=bool)
     reasons: list[str | None] = []
@@ -272,6 +291,8 @@ def _write_propagation_output(
         reasons.extend(report.reasons)
     endpoints.time = np.full(endpoints.n_frames, lag_time_ns * 1000.0)
     endpoints.save_xtc(str(out / "samples.xtc"))
+    if mae:
+        save_mae(endpoints, out / "samples.mae", structure=structure)
     _write_physicality_report(passes_checks, reasons, physicality_filter, out, checked)
     if not checked:
         logger.info("Wrote %d unchecked endpoints to %s", endpoints.n_frames, out)
@@ -378,6 +399,8 @@ def sample_equilibrium_command(
     potentials: Path | None,
     precision: str,
     physicality_filter: str,
+    mae: bool,
+    cif: bool,
     compile_denoiser: bool,
     matmul_precision: str | None,
 ) -> None:
@@ -411,6 +434,8 @@ def sample_equilibrium_command(
         seed=seed,
         output_dir=out,
         physicality_mode=physicality_filter,
+        mae=mae,
+        cif=cif,
     )
 
 
@@ -439,6 +464,8 @@ def predict_structure_command(
     potentials: Path | None,
     precision: str,
     physicality_filter: str,
+    mae: bool,
+    cif: bool,
     compile_denoiser: bool,
     matmul_precision: str | None,
 ) -> None:
@@ -472,6 +499,8 @@ def predict_structure_command(
         seed=seed,
         output_dir=out,
         physicality_mode=physicality_filter,
+        mae=mae,
+        cif=cif,
     )
 
 
@@ -525,6 +554,8 @@ def propagate_command(
     potentials: Path | None,
     precision: str,
     physicality_filter: str,
+    mae: bool,
+    cif: bool,
     compile_denoiser: bool,
     matmul_precision: str | None,
 ) -> None:
@@ -617,6 +648,8 @@ def propagate_command(
         endpoints=endpoints,
         contacts=contacts,
         physicality_filter=PhysicalityFilterMode(physicality_filter),
+        mae=mae,
+        cif=cif,
     )
 
 

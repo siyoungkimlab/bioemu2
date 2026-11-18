@@ -294,9 +294,8 @@ def run_api_on_gpu(
             mode = "high_quality" if name == "predicted" else "no_filter"
             report = check_physicality(samples, mode=mode, system=system)
             output = checkpoint.parent / name
-            reloaded = mdtraj.load_xtc(
-                str(output / "samples.xtc"), top=str(output / "topology.cif")
-            )
+            assert (output / "topology.mae").is_file()
+            reloaded = mdtraj.load_xtc(str(output / "samples.xtc"), top=samples.topology)
             np.testing.assert_allclose(reloaded.xyz, samples.xyz, rtol=0, atol=1e-3)
             assert json.loads((output / "physicality.json").read_text()) == [
                 {

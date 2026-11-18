@@ -43,6 +43,7 @@ from bioemu2.sampling import (
     sample_equilibrium,
     sample_with_embeddings,
 )
+from bioemu2.mae import mae_text, save_mae
 from bioemu2.trajectory_io import map_cif_atom_order, save_frames
 
 __all__ = [
@@ -82,6 +83,8 @@ __all__ = [
     "sample_with_embeddings",
     "simulate_trajectory",
     "simulate_trajectory_with_embeddings",
+    "mae_text",
     "save_frames",
+    "save_mae",
     "map_cif_atom_order",
 ]

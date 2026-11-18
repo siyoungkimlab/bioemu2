@@ -394,7 +394,7 @@ for link, bond in enumerate(glycosylation[:links_per_glycan]):
 # ## Save the generated structures
 #
 # `save_frames` writes the generated coordinates to `samples.xtc` and the
-# matching molecular topology, including the glycans, to `topology.cif`.
+# matching molecular topology, including the glycans, to `topology.mae`.
 
 # %%
 output_dir = Path("outputs/sample_a_glycoprotein")
