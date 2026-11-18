@@ -36,6 +36,7 @@ from bioemu2.denoising.steering.geometry_topology import (
     pack_angle_constraints,
     pack_bond_constraints,
 )
+from bioemu2.denoising.steering.mmff import mmff_terms_from_system
 from bioemu2.structure import AllAtomStructure
 from bioemu2.structure.batch import batch_collate
 
@@ -1011,6 +1012,195 @@ class BondAnglePotential(BondPotential, AnglePotential):
         index = feats["angle_index"][0]
         lower, upper = feats["angle_lower"][0], feats["angle_upper"][0]
         return index, (torch.ones_like(lower), lower, upper), None
+
+
+class MMFFPotential(FeatsPotential):
+    """Shared preparation for the two MMFF ligand terms.
+
+    ``prepare`` runs RDKit's MMFF94 typing once per sampling run and caches the
+    packed indices and parameters alongside the usual topology features.
+    """
+
+    def prepare(self, system: System) -> None:
+        super().prepare(system)
+        terms = mmff_terms_from_system(system)
+        self.feats.update(
+            mmff_bond_index=terms.bond_index,
+            mmff_bond_r0=terms.bond_r0,
+            mmff_bond_kb=terms.bond_kb,
+            mmff_angle_index=terms.angle_index,
+            mmff_angle_theta0=terms.angle_theta0,
+            mmff_torsion_index=terms.torsion_index,
+            mmff_torsion_v1=terms.torsion_v1,
+            mmff_torsion_v2=terms.torsion_v2,
+            mmff_torsion_v3=terms.torsion_v3,
+        )
+
+
+class MMFFBondPotential(MMFFPotential, DistancePotential):
+    """MMFF-typed restraint on every ligand bond length.
+
+    Huber in the length deviation: ``k dr^2`` within ``cutoff`` of r0 and
+    linear beyond, so the curvature at the minimum is MMFF's own force constant
+    while the force stays bounded by ``2 k cutoff``.
+
+    The bound is the point. Guidance takes num_gd_steps descent steps per
+    denoising step, and descent on a quadratic of curvature k diverges for a
+    step above 2/k; an earlier version of this term carried MMFF's force
+    constant unnormalized and blew every ligand out to 14-24 A bonds.
+
+    MMFF's quartic correction is dropped for simplicity, not for correctness:
+    with cs = -2 the shape factor dr^2 - 2 dr^3 + (7/3) dr^4 has no stationary
+    point but dr = 0 (the discriminant of its derivative's quadratic factor is
+    9 - 4(14/3) = -9.67), so it is monotonic either side of the minimum and
+    would have served. It simply has no bounded-force region.
+
+    This exists because BioEmu2 draws ring C-C bonds at roughly one length
+    whatever the hybridisation: 1.413 A for cyclohexane against an ideal 1.53,
+    and 1.412 for benzene against 1.39.
+    """
+
+    def __init__(self, parameters=None, cutoff: float = 0.2,
+                 uniform_k: bool = True) -> None:
+        super().__init__(parameters=parameters)
+        if not math.isfinite(cutoff) or cutoff <= 0:
+            raise ValueError("cutoff must be finite and positive.")
+        self.cutoff = cutoff
+        # Uniform by default, to match the angle term's k = 1. The
+        # hybridisation information this term exists to restore lives in r0,
+        # not in kb.
+        self.uniform_k = uniform_k
+
+    def compute_function(self, value, k, r0):
+        delta = (value - r0).abs()
+        d = self.cutoff
+        return k * torch.where(delta <= d, delta * delta, d * (2.0 * delta - d))
+
+    def _compute_args(self, feats, parameters=None):
+        index = feats["mmff_bond_index"][0]
+        r0 = feats["mmff_bond_r0"][0]
+        k = torch.ones_like(r0) if self.uniform_k else feats["mmff_bond_kb"][0]
+        return index, (k, r0), None
+
+
+class MMFFAnglePotential(MMFFPotential):
+    """MMFF-typed restraint on every ligand bond angle.
+
+    ``E = k (1 - cos(theta - theta0))``, with theta0 taken from MMFF94's own
+    angle-bend parameters. The force is zero at theta0 and bounded by k
+    everywhere, and at theta0 = 180 degrees the form reduces to MMFF's linear
+    bend, so linear geometries need no special case.
+
+    This is a well, not a flat bottom. A flat-bottom angle term cannot forbid a
+    planar six-ring at any tolerance: for a planar hexagon the 1-3 distance is
+    exactly sqrt(3) times the bond, so bond and 1-3 windows that admit the real
+    ring also admit the flat one.
+    """
+
+    _ANGLE_EPS = 1e-9
+
+    def compute_variable(self, coords: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        u = coords.index_select(-2, index[0]) - coords.index_select(-2, index[2])
+        v = coords.index_select(-2, index[1]) - coords.index_select(-2, index[2])
+        u = u / torch.linalg.norm(u, dim=-1, keepdim=True).clamp_min(self._ANGLE_EPS)
+        v = v / torch.linalg.norm(v, dim=-1, keepdim=True).clamp_min(self._ANGLE_EPS)
+        cosine = (u * v).sum(dim=-1)
+        sine = torch.linalg.norm(torch.cross(u, v, dim=-1), dim=-1)
+        return torch.atan2(sine, cosine)
+
+    def compute_function(self, value, k, theta0):
+        return k * (1.0 - torch.cos(value - theta0))
+
+    def _compute_args(self, feats, parameters=None):
+        index = feats["mmff_angle_index"][0]
+        theta0 = feats["mmff_angle_theta0"][0]
+        return index, (torch.ones_like(theta0), theta0), None
+
+
+class MMFFTorsionPotential(MMFFPotential, DihedralPotential):
+    """Three-term MMFF94 torsion on ligand dihedrals.
+
+    ``E = 1/2 [V1 (1 + cos phi) + V2 (1 - cos 2 phi) + V3 (1 + cos 3 phi)]``
+
+    Scoped at preparation time to torsions about ring bonds plus non-ring
+    torsions with V2 > 0; see ``mmff._torsion_terms`` for why.
+    """
+
+    def compute_function(self, value, v1, v2, v3):
+        return 0.5 * (
+            v1 * (1.0 + torch.cos(value))
+            + v2 * (1.0 - torch.cos(2.0 * value))
+            + v3 * (1.0 + torch.cos(3.0 * value))
+        )
+
+    def _compute_args(self, feats, parameters=None):
+        index = feats["mmff_torsion_index"][0]
+        return (
+            index,
+            (feats["mmff_torsion_v1"][0], feats["mmff_torsion_v2"][0],
+             feats["mmff_torsion_v3"][0]),
+            None,
+        )
+
+
+def get_mmff_potentials(
+    *, angle: bool = True, torsion: bool = True, bond: bool = True,
+    angle_weight: float = 0.10, torsion_weight: float = 0.002,
+    bond_weight: float = 0.10, bond_uniform_k: bool = True,
+) -> Sequence[Potential]:
+    """The default potentials plus the requested MMFF ligand terms.
+
+    Weights transfer from the Boltz fork in units but not always in effect:
+    both take num_gd_steps = 20 descent steps on x0_hat per denoising step, so a
+    weight means the same displacement, and the angle term's 0.10 reproduced its
+    Boltz result here without retuning (cyclohexane 0.212 against 0.186).
+
+    The torsion weight is the exception, and is 0.002 here against Boltz's
+    0.001. At 0.001 this model leaves cyclopentane nearly flat (0.043 A against
+    MMFF's 0.177) where Boltz reaches 0.179, because a five-ring puckers by
+    torsion and below that threshold the angle term overcomes it. 0.002 gives
+    0.184, costs the six-rings about 0.008 A, and leaves the aromatics at 0.001;
+    they break between 0.005 and 0.008.
+
+    Stability, not chemistry, bounds these: the inner loop is plain descent with
+    step size guidance_weight, so for a restraint of curvature k it converges
+    only while guidance_weight * k < 1. An earlier bond term carried MMFF's
+    unnormalized kb (~306), putting the product at 30.6, and every ligand blew
+    out to 14-24 A bonds.
+    """
+    extra: list[Potential] = []
+    if bond:
+        extra.append(
+            MMFFBondPotential(
+                uniform_k=bond_uniform_k,
+                parameters={
+                    "guidance_interval": 1,
+                    "guidance_weight": bond_weight,
+                    "resampling_weight": 0.1,
+                },
+            )
+        )
+    if angle:
+        extra.append(
+            MMFFAnglePotential(
+                parameters={
+                    "guidance_interval": 1,
+                    "guidance_weight": angle_weight,
+                    "resampling_weight": 0.1,
+                }
+            )
+        )
+    if torsion:
+        extra.append(
+            MMFFTorsionPotential(
+                parameters={
+                    "guidance_interval": 1,
+                    "guidance_weight": torsion_weight,
+                    "resampling_weight": 0.1,
+                }
+            )
+        )
+    return (*get_default_potentials(), *extra)
 
 
 def get_default_potentials() -> Sequence[Potential]:
