@@ -120,7 +120,8 @@ bioemu2 predict-structure \
   --out outputs/ubiquitin
 ```
 
-Propagate each sampled adenylate kinase conformation by 1 ns:
+Propagate each sampled adenylate kinase conformation by 1 ns (sample with
+`--cif` to get the `topology.cif` this reads):
 
 ```bash
 bioemu2 propagate \
@@ -159,8 +160,10 @@ endpoints = emu.propagate(samples, lag_time_ns=1.0)
 save_frames(endpoints, Path("outputs/adk-propagated"))
 ```
 
-`save_frames()` writes `samples.xtc` and `topology.cif` to each output
-directory.
+`save_frames()` writes `samples.xtc` and `topology.mae` to each output
+directory: the topology is the first sample as a Maestro structure with bond
+orders and formal charges. `mae=True` (or `--mae` on the command line) adds
+`samples.mae` with every sample, and `cif=True` (`--cif`) adds `topology.cif`.
 
 See [define molecular systems](docs/system.md), [predict and sample
 structures](docs/sampling.md), and [propagate structures](docs/propagation.md)

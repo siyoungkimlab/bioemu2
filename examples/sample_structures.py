@@ -88,8 +88,8 @@ equilibrium_view.show()
 # ## Save the generated structures
 #
 # `save_frames` writes the generated coordinates to `samples.xtc` and the
-# matching molecular topology to `topology.cif`. You can read these files later
-# with `mdtraj.load_xtc(...)`:
+# matching molecular topology to `topology.mae`, plus `topology.cif` with
+# `cif=True`. You can read these files later with `mdtraj.load_xtc(...)`:
 #
 # ```python
 # samples = mdtraj.load_xtc(
@@ -100,8 +100,8 @@ equilibrium_view.show()
 
 # %%
 output_dir = Path("outputs/sample_structures")
-prediction_path = save_frames(prediction_samples, output_dir / "prediction")
-equilibrium_path = save_frames(equilibrium_samples, output_dir / "equilibrium")
+prediction_path = save_frames(prediction_samples, output_dir / "prediction", cif=True)
+equilibrium_path = save_frames(equilibrium_samples, output_dir / "equilibrium", cif=True)
 
 print(prediction_path)
 print(equilibrium_path)

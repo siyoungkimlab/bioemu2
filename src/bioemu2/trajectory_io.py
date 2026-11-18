@@ -8,6 +8,7 @@ from biotite.structure import AtomArray
 from biotite.structure.io import pdbx
 
 from bioemu2.data_interface import System
+from bioemu2.mae import save_mae
 from bioemu2.physicality import PhysicalityReport
 from bioemu2.structure.all_atom_structure import AllAtomStructure
 from bioemu2.structure.ref_struct import (
@@ -64,12 +65,18 @@ def save_frames(
     output_dir: str | Path,
     *,
     physicality: PhysicalityReport | None = None,
+    mae: bool = False,
+    cif: bool = False,
 ) -> Path:
-    """Save all frames and a topology CIF, optionally with a physicality report.
+    """Save all frames and a topology MAE, optionally with a physicality report.
 
     Chain IDs are preserved when every chain has an ID. Pass the result of
     ``check_physicality`` as ``physicality`` to also write ``physicality.json``.
-    The report must describe these frames in the same order.
+    The report must describe these frames in the same order. The topology is
+    ``topology.mae``, the first frame with the bond orders and formal charges
+    the topology carries. With ``mae``, ``samples.mae`` is written too, one
+    structure per frame; see :func:`bioemu2.save_mae` to write either from the
+    system's structure instead. With ``cif``, ``topology.cif`` is written too.
     """
     if trajectory.n_frames == 0:
         raise ValueError("trajectory must contain at least one frame.")
@@ -85,7 +92,11 @@ def save_frames(
     output_dir.mkdir(parents=True, exist_ok=True)
     trajectory_path = output_dir / "samples.xtc"
     trajectory.save_xtc(trajectory_path)
-    save_mdtraj_cif_frame(trajectory[0], output_dir / "topology.cif")
+    save_mae(trajectory[0], output_dir / "topology.mae", titles=["topology"])
+    if cif:
+        save_mdtraj_cif_frame(trajectory[0], output_dir / "topology.cif")
+    if mae:
+        save_mae(trajectory, output_dir / "samples.mae")
     if physicality is not None:
         physicality.save(output_dir / "physicality.json")
     return trajectory_path

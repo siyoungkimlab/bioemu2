@@ -87,11 +87,11 @@ def test_cp_cli_pipeline(
     assert {path.name for path in out.iterdir()} == {
         "samples.xtc",
         "physicality.json",
-        "topology.cif",
+        "topology.mae",
         "system.yaml",
         "command.txt",
     }
-    trajectory = mdtraj.load(str(out / "samples.xtc"), top=str(out / "topology.cif"))
+    trajectory = mdtraj.load(str(out / "samples.xtc"), top=system.topology)
     assert trajectory.n_frames == 3
     report = check_physicality(trajectory, mode=physicality_mode, system=system)
     assert json.loads((out / "physicality.json").read_text()) == [

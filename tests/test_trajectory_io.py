@@ -30,7 +30,7 @@ def test_save_trajectory_writes_reloadable_xtc_and_cif(tmp_path) -> None:
         topology=topology,
     )
 
-    trajectory_path = save_frames(trajectory, tmp_path / "nested" / "samples")
+    trajectory_path = save_frames(trajectory, tmp_path / "nested" / "samples", cif=True)
 
     topology_path = trajectory_path.parent / "topology.cif"
     assert trajectory_path == tmp_path / "nested" / "samples" / "samples.xtc"
@@ -57,7 +57,7 @@ def test_save_mdtraj_cif_preserves_known_charges_and_marks_unknown(tmp_path) -> 
         topology.add_atom(element.symbol.upper(), element, residue, formal_charge=charge)
     trajectory = mdtraj.Trajectory(np.zeros((1, 2, 3)), topology)
 
-    save_frames(trajectory, tmp_path)
+    save_frames(trajectory, tmp_path, cif=True)
 
     atom_site = pdbx.CIFFile.read(str(tmp_path / "topology.cif")).block["atom_site"]
     assert atom_site["pdbx_formal_charge"].as_array(str).tolist() == ["1", "?"]

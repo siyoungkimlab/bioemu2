@@ -167,7 +167,8 @@ def test_predict_structure_without_protein(
     assert trajectory.topology == system.topology
     assert np.isfinite(trajectory.xyz).all()
     assert (out / "samples.xtc").is_file()
-    assert (out / "topology.cif").is_file()
+    assert (out / "topology.mae").is_file()
+    assert not (out / "topology.cif").exists()
     assert json.loads((out / "physicality.json").read_text()) == [
         {"frame": 0, "status": "not_checked", "reason": None}
     ]
@@ -197,11 +198,13 @@ def test_high_level_sampling_saves_all_frames_and_physicality(
         progress=False,
         output_dir=str(out),
         physicality_mode=physicality_mode,
+        cif=True,
     )
 
     assert samples.n_frames == 2
     assert {path.name for path in out.iterdir()} == {
         "samples.xtc",
+        "topology.mae",
         "topology.cif",
         "system.yaml",
         "physicality.json",
@@ -330,7 +333,7 @@ def test_sampling_retains_failed_frames_with_separate_saveable_physicality(
     assert not report.passed.any()
     assert all(reason is not None for reason in report.reasons)
     np.testing.assert_array_equal(samples.xyz, original_coords)
-    path = save_frames(samples, tmp_path / workflow, physicality=report)
+    path = save_frames(samples, tmp_path / workflow, physicality=report, cif=True)
     reloaded = mdtraj.load_xtc(str(path), top=str(path.parent / "topology.cif"))
     np.testing.assert_allclose(reloaded.xyz, original_coords, atol=1e-3)
     assert json.loads((path.parent / "physicality.json").read_text()) == [
@@ -1316,6 +1319,7 @@ def test_cli_pipeline(
             str(out),
             "--physicality-filter",
             "no_filter",
+            "--cif",
             *extra_args,
         ],
         catch_exceptions=False,
@@ -1328,6 +1332,7 @@ def test_cli_pipeline(
         xtcs, n_frames = {"samples.xtc"}, 1 if command == "predict-structure" else 2
     extra = {"physicality.json"}
     assert {p.name for p in out.iterdir()} == xtcs | extra | {
+        "topology.mae",
         "topology.cif",
         "system.yaml",
         "command.txt",
@@ -1390,6 +1395,7 @@ def test_cli_resumes_and_cleans_up_after_saving(
         "2",
         "--out",
         str(out),
+        "--cif",
     ]
     runner = CliRunner()
     partial_dir = out / "partial"
@@ -1464,6 +1470,7 @@ def test_cli_writes_rejected_samples(
         str(out),
         "--num-samples",
         "2",
+        "--cif",
     ]
 
     result = CliRunner().invoke(cli.main, args, catch_exceptions=False)
@@ -1489,7 +1496,7 @@ def _propagate_argv(tiny_checkpoint: Path, out: Path, x0_args: list[str]) -> lis
     return (
         ["propagate", "--system", str(EXAMPLES_DIR / "chignolin.yaml")]
         + ["--checkpoint-path", str(tiny_checkpoint), "--out", str(out)]
-        + [*x0_args, "--lag-time-ns", "1"]
+        + [*x0_args, "--lag-time-ns", "1", "--cif"]
     )
 
 
@@ -1780,6 +1787,7 @@ def test_propagate_infers_ccd_ligand_from_cif(
             "no_filter",
             "--out",
             str(out),
+            "--cif",
         ],
         catch_exceptions=False,
     )

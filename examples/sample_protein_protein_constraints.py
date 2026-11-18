@@ -91,7 +91,7 @@ def predict():
             samples = session.sample(
                 num_samples=5, batch_size=1, seed=42, sampler=EDMSampler(num_steps=200, step_scale=1.5),
             )
-            save_frames(samples, directory)
+            save_frames(samples, directory, cif=True)
             del session
         predictions[condition] = samples
     return predictions

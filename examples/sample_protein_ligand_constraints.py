@@ -149,7 +149,12 @@ if run_inference:
             num_samples=5, batch_size=1, seed=seed,
             sampler=EDMSampler(num_steps=200, step_scale=1.5),
         )
-        save_frames(samples, outputs / case, physicality=check_physicality(samples, system=system))
+        save_frames(
+            samples,
+            outputs / case,
+            physicality=check_physicality(samples, system=system),
+            cif=True,
+        )
         emu.cache_clear()
 
 # %% [markdown]

@@ -42,7 +42,8 @@ settings, such as step scale, use the
 
 With `output_dir`, these functions check physicality and save every frame,
 including frames that fail the checks, to `samples.xtc`, together with
-`topology.cif`, `system.yaml`, and `physicality.json`. `physicality_mode`
+`topology.mae`, `system.yaml`, and `physicality.json` (`cif=True` adds
+`topology.cif`). `physicality_mode`
 selects the check thresholds (default `"high_quality"`). Without `output_dir`,
 they return frames without checking or saving them.
 
@@ -104,7 +105,7 @@ system = System.from_pdb_id("1AKE")
 model = load_model()
 x0 = sample_equilibrium(system, model=model, num_samples=1)
 start_dir = Path("outputs/adk-start")
-save_frames(x0, start_dir)
+save_frames(x0, start_dir, cif=True)
 x_tau = propagate(
     model=model,
     x0=start_dir / "topology.cif",
