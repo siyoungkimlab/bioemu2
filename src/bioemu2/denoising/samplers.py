@@ -149,13 +149,16 @@ class GuidedFKSampler(Sampler):
         batch_size: int,
         tracker: Tracker | None = None,
     ) -> BatchAllAtomStructure:
+        # particles_per_sample is read by generate_samples, which sizes the
+        # batch with it; the sampler function itself knows nothing about it.
+        fields = {k: v for k, v in vars(self).items() if k != "particles_per_sample"}
         return edm_steered_sampler(
             batch=batch,
             score_model=score_model,
             trunk_embeddings=trunk_embeddings,
             multiplicity=batch_size,
             tracker=tracker,
-            **vars(self),
+            **fields,
         )
 
 
