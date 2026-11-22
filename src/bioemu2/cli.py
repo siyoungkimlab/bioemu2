@@ -113,6 +113,9 @@ _SAMPLER_FIELDS: dict[str, str] = {
     "langevin_kT": "edm_gd, edm_fk (kcal/mol; Langevin guidance, none = plain descent)",
     "langevin_weight": "edm_gd, edm_fk (guidance weight w of the noise sqrt(2 w kT))",
     "langevin_t_on": "edm_gd, edm_fk (Langevin noise only for t <= this)",
+    "particles_per_sample": "edm_gd, edm_fk (particles carried per requested sample; "
+                            "--num-samples still sets how many are written. 5 for the "
+                            "ligand force-field presets, 1 otherwise)",
     "ess_threshold": "edm_fkc",
     "beta_power": "edm_fkc",
     "gamma_0": "edm_fkc",

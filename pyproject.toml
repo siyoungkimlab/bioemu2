@@ -42,6 +42,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# GAFF2 and OpenFF ligand steering (--sampler gaff2 / openff-2.2.1): boonza
+# parameterizes the ligand from its SMILES, and it calls AmberTools' antechamber
+# for AM1-BCC charges, which conda provides and pip cannot. Without these the
+# parameters must already be in the cache. The MMFF terms need neither.
+ligand-ff = [
+    "boonza @ git+https://github.com/siyoungkimlab/boonza",
+]
 cuda = [
     "cuequivariance==0.11.1; sys_platform == 'linux'",
     "cuequivariance-torch==0.11.1; sys_platform == 'linux'",

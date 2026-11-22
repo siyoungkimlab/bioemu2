@@ -297,6 +297,34 @@ MMFF_WEIGHT = 0.0005
 #: balance, since every term enters as w * fc.
 GAFF2_WEIGHT = 0.0005
 
+#: The per-term weights the ligand presets steer with, measured on a 15-ligand
+#: benchmark against 30 ns of GAFF2 and OpenFF MD. Bonds and angles are held
+#: an order of magnitude below the terms that decide conformation, because the
+#: bonded terms are what the guidance distorts when it is pushed; torsion and
+#: nonbonded carry the conformational preference.
+LIGAND_STEER_BOND_WEIGHT = 0.001
+LIGAND_STEER_ANGLE_WEIGHT = 0.001
+LIGAND_STEER_PAIR14_WEIGHT = 0.001
+LIGAND_STEER_TORSION_WEIGHT = 0.005
+#: The nonbonded weight differs by force field: 0.0075 was better for MMFF and
+#: OpenFF (MMFF 4.0 -> 0.4% wrong torsion states, OpenFF 15.9 -> 5.0%), while
+#: GAFF2 was a wash and keeps the more reproducible 0.005.
+LIGAND_STEER_NONBONDED_WEIGHT = {"gaff2": 0.005, "mmff": 0.0075}
+
+#: Guidance applies only below this diffusion time: torsions are decided around
+#: t = 0.3-0.15, and steering earlier fights the model while the ligand is still
+#: forming.
+LIGAND_STEER_T_ON = 0.4
+
+#: Langevin guidance: x0 <- x0 - sum w grad E + sqrt(2 w kT) xi. kT is room
+#: temperature in kcal/mol. Plain descent drives every particle into the nearest
+#: minimum and tears stiff bonds; the noise lets it leave a bad basin.
+LIGAND_STEER_LANGEVIN_KT = 0.593
+LIGAND_STEER_LANGEVIN_WEIGHT = 0.005
+
+#: Particles carried per requested sample; see particles_per_sample.
+LIGAND_STEER_PARTICLES_PER_SAMPLE = 5
+
 class ParameterSchedule(ABC):
     def compute(self, t: float) -> float:
         raise NotImplementedError
@@ -1617,7 +1645,6 @@ class MMFFNonbondedPotential(HydrogenMixin, MMFFPotential):
         # The electrostatic part relative to the steric part. They do
         # different jobs, and round 3 put the GAFF optimum at 3.0 -- a setting
         # that does not exist with a single knob.
-        # How far a charge reaches. The default is boonza's 12 A,
         # a vacuum range: in water these charges are screened by a
         # dielectric of ~78, and at 12 A a zwitterion's two ends
         # attract strongly enough to force a ring substituent axial
@@ -2673,11 +2700,8 @@ class NonbondedPotential(HydrogenMixin, GAFFPotential):
         lj   = 4 eps ((sig/rr)^12 - (sig/rr)^6),  rr = max(r, 0.5 sig)
         coul = C q_i q_j cos^2(pi r / 2 r_c)
 
-    A and C are boonza's (100 and 50 kJ/mol, converted). The repulsion is
-    bounded at coincidence, which is what makes REM usable on a clashing
-    structure, and the electrostatic term is a bounded cosine rather than
-    332 q q / r -- it carries the sign and the distance dependence of an
-    electrostatic preference, not its magnitude.
+    Both terms are bounded at coincidence by their core switch, so a clashing
+    early structure gives a finite energy and a finite force.
 
     Scope: 1-2, 1-3 and 1-4 pairs are all excluded, the 1-4s because they are
     a separate term with the force field's own scaling. For a small ligand
@@ -2722,8 +2746,6 @@ class NonbondedPotential(HydrogenMixin, GAFFPotential):
         # term is the only thing here that can produce a charge-DEPENDENT
         # conformation. One knob for both means raising the electrostatics to
         # fix histamine also raises the sterics, which distorts other systems.
-        # 1.0 reproduces boonza's REM exactly.
-        # How far a charge reaches. The default is boonza's 12 A,
         # a vacuum range: in water these charges are screened by a
         # dielectric of ~78, and at 12 A a zwitterion's two ends
         # attract strongly enough to force a ring substituent axial

@@ -73,6 +73,55 @@ def _apply_sampler_params(sampler: Sampler, params: dict | None) -> Sampler:
     return sampler
 
 
+def _ligand_sampler_kw() -> dict:
+    """Sampler settings shared by the ligand force-field presets."""
+    from bioemu2.denoising.steering.potentials import (
+        LIGAND_STEER_LANGEVIN_KT,
+        LIGAND_STEER_LANGEVIN_WEIGHT,
+        LIGAND_STEER_PARTICLES_PER_SAMPLE,
+        LIGAND_STEER_T_ON,
+    )
+
+    return {
+        "langevin_kT": LIGAND_STEER_LANGEVIN_KT,
+        "langevin_weight": LIGAND_STEER_LANGEVIN_WEIGHT,
+        "langevin_t_on": LIGAND_STEER_T_ON,
+        "particles_per_sample": LIGAND_STEER_PARTICLES_PER_SAMPLE,
+    }
+
+
+def _ligand_potential_kw(preset: str) -> dict:
+    """Force-field settings shared by the ligand presets.
+
+    ``hydrogen=True`` because the models predict heavy atoms only and the
+    heavy-only torsion path is INVERTED, not merely weaker -- see HydrogenMixin.
+    The angle cutoff keeps ordinary strain quadratic and bounds the force past
+    0.35 rad, the only term of ours whose force would otherwise be unbounded.
+    """
+    from bioemu2.denoising.steering.potentials import (
+        LIGAND_STEER_ANGLE_WEIGHT,
+        LIGAND_STEER_BOND_WEIGHT,
+        LIGAND_STEER_NONBONDED_WEIGHT,
+        LIGAND_STEER_PAIR14_WEIGHT,
+        LIGAND_STEER_T_ON,
+        LIGAND_STEER_TORSION_WEIGHT,
+    )
+
+    kw = {
+        "hydrogen": True,
+        "nonbonded": True,
+        "t_on": LIGAND_STEER_T_ON,
+        "bond_weight": LIGAND_STEER_BOND_WEIGHT,
+        "angle_weight": LIGAND_STEER_ANGLE_WEIGHT,
+        "torsion_weight": LIGAND_STEER_TORSION_WEIGHT,
+        "pair14_weight": LIGAND_STEER_PAIR14_WEIGHT,
+        "nonbonded_weight": LIGAND_STEER_NONBONDED_WEIGHT.get(preset, 0.0075),
+    }
+    if preset != "mmff":
+        kw |= {"bond_uniform_k": False, "angle_uniform_k": False, "angle_cutoff": 0.35}
+    return kw
+
+
 def sampler_from_preset(
     preset: str,
     *,
@@ -97,38 +146,19 @@ def sampler_from_preset(
         # hydrogen=True because the models predict heavy atoms only and the
         # heavy-only torsion path is INVERTED, not merely weaker -- see
         # HydrogenMixin.
-        sampler = GuidedFKSampler(step_scale=step_scale)
+        sampler = GuidedFKSampler(step_scale=step_scale, **_ligand_sampler_kw())
         if potentials is None:
             from bioemu2.denoising.steering.potentials import get_mmff_potentials
-            potentials = get_mmff_potentials(hydrogen=True)
+            potentials = get_mmff_potentials(**_ligand_potential_kw("mmff"))
     elif preset in GAFF_PRESETS:
-        # The GAFF2 counterpart of the mmff preset: real bond and angle
-        # constants (the bond term used k=1 for everything, and
-        # gaff_bond_fc did not even reach the features), the nonbonded
-        # term on, and one shared weight so GAFF2's own balance is kept.
-        sampler = GuidedFKSampler(step_scale=step_scale)
+        # The GAFF2 counterpart of the mmff preset: the ligand force field's own
+        # bond and angle constants, the nonbonded term on, and the per-term
+        # weights of LIGAND_STEER_*.
+        sampler = GuidedFKSampler(step_scale=step_scale, **_ligand_sampler_kw())
         if potentials is None:
-            from bioemu2.denoising.steering.potentials import (
-                GAFF2_WEIGHT,
-                get_gaff_potentials,
-            )
-            potentials = get_gaff_potentials(
-                hydrogen=True,
-                ligand_ff=preset,  # gaff2 or an OpenFF release
-                bond_uniform_k=False,
-                angle_uniform_k=False,
-                # 0.35 rad (20 deg): ordinary strain stays
-                # quadratic, and past that the force is bounded at
-                # 2 k cutoff. GAFF's angle is the only term of ours
-                # whose force would otherwise be unbounded.
-                angle_cutoff=0.35,
-                nonbonded=True,
-                bond_weight=GAFF2_WEIGHT,
-                angle_weight=GAFF2_WEIGHT,
-                torsion_weight=GAFF2_WEIGHT,
-                pair14_weight=GAFF2_WEIGHT,
-                nonbonded_weight=GAFF2_WEIGHT,
-            )
+            from bioemu2.denoising.steering.potentials import get_gaff_potentials
+            potentials = get_gaff_potentials(ligand_ff=preset,
+                                             **_ligand_potential_kw(preset))
     else:
         raise ValueError(
             f"Unknown sampler preset: {preset}. Choose from: "
@@ -202,8 +232,12 @@ def generate_samples(
         partial_dir.mkdir(parents=True, exist_ok=True)
     for potential in getattr(sampler, "potentials", ()):
         potential.prepare(system)
+    # The sampler runs with k particles per requested sample; FK resampling then
+    # selects among all of them and the requested number is drawn afterwards.
+    per_sample = max(1, int(getattr(sampler, "particles_per_sample", 1) or 1))
     for start in trange(0, num_samples, batch_size, disable=not progress, desc="Sampling"):
         size = min(batch_size, num_samples - start)
+        pool = size * per_sample
         batch_seed = seed + start // batch_size if seed is not None else None
         if partial_dir is not None:
             batch_path = partial_dir / f"samples_{start:06d}-{start + size:06d}.npy"
@@ -229,11 +263,18 @@ def generate_samples(
                 batch=batch,
                 score_model=score_model,
                 trunk_embeddings=trunk_embeddings,
-                batch_size=size,
+                batch_size=pool,
                 tracker=tracker,
             )
+            xyz = sampled.coords.view(pool, -1, 3)
+            if per_sample > 1:
+                # Global resampling leaves the particles equally weighted draws
+                # from the tilted distribution, so an unweighted subset is the
+                # unbiased choice; weighting them again would tilt twice.
+                keep = torch.randperm(pool, device=xyz.device)[:size]
+                xyz = xyz[keep]
 
-        xyz = sampled.coords.view(size, -1, 3)
+        xyz = xyz.view(size, -1, 3)
         xyz = xyz[:, :num_atoms]
         xyz = xyz - xyz.mean(dim=1, keepdim=True)
         if partial_dir is not None:

@@ -124,10 +124,13 @@ def gaff_terms_from_system(system: System, ligand_ff: str | None = None) -> GAFF
 
     from rdkit.Chem import AddHs, MolFromSmiles, RemoveAllHs
 
+    considered = 0
+    parameterized = 0
     for atom_lo, atom_hi in _iter_ligand_residues(batch, 0, atom_chain[0]):
         smiles = smiles_by_chain.get(int(atom_chain[0, atom_lo].item()))
         if smiles is None:
             continue
+        considered += 1
         reason = unsupported_ligand_reason(smiles, GAFF_ELEMENTS)
         if reason is not None:
             logger.info("GAFF: leaving %r unsteered (%s)", smiles, reason)
@@ -141,6 +144,7 @@ def gaff_terms_from_system(system: System, ligand_ff: str | None = None) -> GAFF
         data = parameters_for(smiles, protein_ff=PROTEIN_FF, ligand_ff=ligand_ff)
         if data is None:
             continue
+        parameterized += 1
         mol = MolFromSmiles(smiles)
         mol_w_hs = AddHs(mol)
         _assign_mol_atom_names(mol_w_hs)
@@ -285,6 +289,13 @@ def gaff_terms_from_system(system: System, ligand_ff: str | None = None) -> GAFF
                              dtype=torch.float32, device=device)
     if fc_tensor.numel() == 0:
         fc_tensor = fc_tensor.reshape(1, 0, 7)
+
+    if considered and not parameterized:
+        logger.warning(
+            "%s: none of the %d ligand chain(s) could be parameterized, so the ligand "
+            "terms are empty and this run is effectively unsteered. Install the "
+            "ligand-ff extra (boonza) plus AmberTools, or warm the parameter cache.",
+            ligand_ff or "GAFF", considered)
 
     return GAFFTerms(
         bond_index=index(bond_rows), bond_r0=values(bond_r0), bond_fc=values(bond_fc),

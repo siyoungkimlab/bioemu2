@@ -116,6 +116,10 @@ class GuidedFKSampler(Sampler):
     noise_scale: float = 1.0
     potentials: Sequence[Potential] = field(default_factory=get_default_potentials)
     resampling_interval: int | None = 3
+    #: Particles carried per requested sample. The sampler runs with
+    #: ``particles_per_sample * num_samples`` particles and the requested
+    #: number is drawn from them afterwards; 1 keeps one particle per sample.
+    particles_per_sample: int = 1
     resampling_group_size: int | None = None
     fk_lambda: float = 4.0
     num_gd_steps: int = 20
