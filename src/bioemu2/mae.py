@@ -161,6 +161,7 @@ def mae_text(
     structure: AllAtomStructure | None = None,
     titles: list[str] | None = None,
     bfactors: np.ndarray | None = None,
+    properties: list[dict[str, float]] | None = None,
 ) -> str:
     """The MAE text for ``trajectory``: one ``f_m_ct`` block per frame.
 
@@ -171,6 +172,11 @@ def mae_text(
         titles: One ``s_m_title`` per frame; ``sample_<i>`` by default.
         bfactors: Optional ``(frames, atoms)`` values for ``r_m_pdb_tfactor``,
             such as a per-atom confidence; zero by default.
+        properties: One dict of ct-level properties per frame, such as the
+            steering energy of each potential. Keys must be MAE property names
+            (``r_`` real, ``i_`` integer, ``s_`` string, ``b_`` boolean) and
+            every frame must carry the same keys, because the block header
+            names them once.
     """
     if trajectory.n_frames == 0:
         raise ValueError("trajectory must contain at least one frame.")
@@ -180,6 +186,18 @@ def mae_text(
         raise ValueError("titles must contain one entry per trajectory frame.")
     if bfactors is not None and np.shape(bfactors) != (trajectory.n_frames, trajectory.n_atoms):
         raise ValueError("bfactors must have shape (frames, atoms).")
+    prop_names: tuple[str, ...] = ()
+    if properties is not None:
+        if len(properties) != trajectory.n_frames:
+            raise ValueError("properties must contain one dict per trajectory frame.")
+        prop_names = tuple(properties[0])
+        for entry in properties:
+            if tuple(entry) != prop_names:
+                raise ValueError("every properties entry must carry the same keys.")
+        for name in prop_names:
+            if not name.startswith(("r_", "i_", "s_", "b_")):
+                raise ValueError(
+                    f"MAE property {name!r} needs an r_/i_/s_/b_ type prefix.")
     topology = trajectory.topology
     bonds = _bonds(topology, structure)
     charges = _charges(topology, structure)
@@ -188,7 +206,22 @@ def mae_text(
     chunks = [_VERSION_BLOCK]
     for frame in range(trajectory.n_frames):
         title = titles[frame] if titles is not None else f"sample_{frame}"
-        lines = ["f_m_ct {", "  s_m_title", "  :::", f"  {_quote(title)}"]
+        lines = ["f_m_ct {", "  s_m_title"]
+        lines.extend(f"  {name}" for name in prop_names)
+        lines.append("  :::")
+        lines.append(f"  {_quote(title)}")
+        if prop_names:
+            entry = properties[frame]
+            for name in prop_names:
+                value = entry[name]
+                if name.startswith("r_"):
+                    lines.append(f"  {float(value):.6f}")
+                elif name.startswith("i_"):
+                    lines.append(f"  {int(value)}")
+                elif name.startswith("b_"):
+                    lines.append(f"  {int(bool(value))}")
+                else:
+                    lines.append(f"  {_quote(value)}")
         lines.append(f"  m_atom[{len(atoms)}] {{")
         lines.extend(f"    {column}" for column in _ATOM_COLUMNS)
         lines.append("    :::")
@@ -224,9 +257,11 @@ def save_mae(
     structure: AllAtomStructure | None = None,
     titles: list[str] | None = None,
     bfactors: np.ndarray | None = None,
+    properties: list[dict[str, float]] | None = None,
 ) -> Path:
     """Write ``trajectory`` to ``path`` as MAE; see :func:`mae_text`."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(mae_text(trajectory, structure=structure, titles=titles, bfactors=bfactors))
+    path.write_text(mae_text(trajectory, structure=structure, titles=titles,
+                             bfactors=bfactors, properties=properties))
     return path

@@ -1,12 +1,13 @@
 """Structure prediction and equilibrium sampling with physicality filtering."""
 
+import json
 import logging
 import shutil
 from collections import Counter
 from collections.abc import Collection, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal
+from typing import get_args, Literal
 
 import mdtraj
 import numpy as np
@@ -42,7 +43,34 @@ from bioemu2.trajectory_io import coords_angstrom_to_trajectory
 
 logger = logging.getLogger(__name__)
 
-SamplerPreset = Literal["edm", "edm_gd", "edm_fk", "edm_fkc"]
+SamplerPreset = Literal["edm", "edm_gd", "edm_fk", "edm_fkc",
+                        "mmff", "gaff2", "openff-2.2.1"]
+#: Presets built from get_gaff_potentials, each named for its ligand force field.
+GAFF_PRESETS = ("gaff2", "openff-2.2.1")
+
+
+def _apply_sampler_params(sampler: Sampler, params: dict | None) -> Sampler:
+    """Set named fields on a constructed sampler, validated against its class.
+
+    Sampler fields are preset-dependent -- num_gd_steps and fk_lambda belong to
+    GuidedFKSampler, ess_threshold and the reheat schedule to FKCSampler, and
+    EDMSampler has neither -- so naming a field the chosen sampler does not
+    have is rejected with the list of fields it does have. Silently ignoring
+    it would look like the override had been applied.
+    """
+    if not params:
+        return sampler
+    import dataclasses
+
+    known = {f.name for f in dataclasses.fields(sampler)}
+    for name, value in params.items():
+        if name not in known:
+            raise ValueError(
+                f"{type(sampler).__name__} has no field {name!r}. "
+                f"Available: {', '.join(sorted(known))}"
+            )
+        setattr(sampler, name, value)
+    return sampler
 
 
 def sampler_from_preset(
@@ -51,6 +79,7 @@ def sampler_from_preset(
     mode: SamplingMode,
     num_steps: int | None = None,
     potentials: Sequence[Potential] | None = None,
+    sampler_params: dict | None = None,
 ) -> Sampler:
     step_scale = 1.5 if mode == "structure" else 1.0
     sampler: Sampler
@@ -62,9 +91,48 @@ def sampler_from_preset(
         sampler = GuidedFKSampler(step_scale=step_scale, resampling_interval=None)
     elif preset == "edm_fk":
         sampler = GuidedFKSampler(step_scale=step_scale)
+    elif preset == "mmff":
+        # edm_fk's sampler, steered with the MMFF ligand terms on top of the
+        # physicality set (get_mmff_potentials appends that set itself).
+        # hydrogen=True because the models predict heavy atoms only and the
+        # heavy-only torsion path is INVERTED, not merely weaker -- see
+        # HydrogenMixin.
+        sampler = GuidedFKSampler(step_scale=step_scale)
+        if potentials is None:
+            from bioemu2.denoising.steering.potentials import get_mmff_potentials
+            potentials = get_mmff_potentials(hydrogen=True)
+    elif preset in GAFF_PRESETS:
+        # The GAFF2 counterpart of the mmff preset: real bond and angle
+        # constants (the bond term used k=1 for everything, and
+        # gaff_bond_fc did not even reach the features), the nonbonded
+        # term on, and one shared weight so GAFF2's own balance is kept.
+        sampler = GuidedFKSampler(step_scale=step_scale)
+        if potentials is None:
+            from bioemu2.denoising.steering.potentials import (
+                GAFF2_WEIGHT,
+                get_gaff_potentials,
+            )
+            potentials = get_gaff_potentials(
+                hydrogen=True,
+                ligand_ff=preset,  # gaff2 or an OpenFF release
+                bond_uniform_k=False,
+                angle_uniform_k=False,
+                # 0.35 rad (20 deg): ordinary strain stays
+                # quadratic, and past that the force is bounded at
+                # 2 k cutoff. GAFF's angle is the only term of ours
+                # whose force would otherwise be unbounded.
+                angle_cutoff=0.35,
+                nonbonded=True,
+                bond_weight=GAFF2_WEIGHT,
+                angle_weight=GAFF2_WEIGHT,
+                torsion_weight=GAFF2_WEIGHT,
+                pair14_weight=GAFF2_WEIGHT,
+                nonbonded_weight=GAFF2_WEIGHT,
+            )
     else:
         raise ValueError(
-            f"Unknown sampler preset: {preset}. Choose from: edm, edm_gd, edm_fk, edm_fkc"
+            f"Unknown sampler preset: {preset}. Choose from: "
+                + ", ".join(get_args(SamplerPreset))
         )
     if num_steps is not None:
         if num_steps <= 0:
@@ -74,7 +142,7 @@ def sampler_from_preset(
         if not isinstance(sampler, GuidedFKSampler | FKCSampler):
             raise ValueError("potentials requires a steering sampler (edm_gd, edm_fk, edm_fkc)")
         sampler.potentials = tuple(potentials)
-    return sampler
+    return _apply_sampler_params(sampler, sampler_params)
 
 
 def warn_batch_size(num_tokens: int, num_samples: int, batch_size: int) -> None:
@@ -384,10 +452,12 @@ def _embed_and_sample(
     physicality_mode: PhysicalityFilterMode | str,
     mae: bool = False,
     cif: bool = False,
+    sampler_params: dict | None = None,
 ) -> mdtraj.Trajectory:
     physicality_mode = normalize_physicality_mode(physicality_mode)
     configured_sampler = sampler_from_preset(
-        sampler, mode=mode, num_steps=num_steps, potentials=potentials
+        sampler, mode=mode, num_steps=num_steps, potentials=potentials,
+        sampler_params=sampler_params
     )
     out = Path(output_dir) if output_dir is not None else None
     managed_partial_dir = out / "partial" if out is not None and partial_dir is None else None
@@ -416,6 +486,7 @@ def _embed_and_sample(
             physicality_filter=physicality_mode,
             mae=mae,
             cif=cif,
+            potentials=getattr(configured_sampler, "potentials", None),
         )
         if managed_partial_dir is not None:
             shutil.rmtree(managed_partial_dir)
@@ -431,6 +502,7 @@ def predict_structure(
     batch_size: int | None = None,
     sampler: SamplerPreset = "edm",
     num_steps: int | None = None,
+    sampler_params: dict | None = None,
     potentials: Sequence[Potential] | None = None,
     seed: int | None = None,
     progress: bool = True,
@@ -482,6 +554,7 @@ def predict_structure(
         batch_size=batch_size,
         sampler=sampler,
         num_steps=num_steps,
+        sampler_params=sampler_params,
         potentials=potentials,
         seed=seed,
         progress=progress,
@@ -502,6 +575,7 @@ def sample_equilibrium(
     batch_size: int | None = None,
     sampler: SamplerPreset = "edm",
     num_steps: int | None = None,
+    sampler_params: dict | None = None,
     potentials: Sequence[Potential] | None = None,
     seed: int | None = None,
     progress: bool = True,
@@ -553,6 +627,7 @@ def sample_equilibrium(
         batch_size=batch_size,
         sampler=sampler,
         num_steps=num_steps,
+        sampler_params=sampler_params,
         potentials=potentials,
         seed=seed,
         progress=progress,
@@ -584,6 +659,191 @@ def write_sampling_system(
     )
 
 
+def _reconstructed_hydrogens(trajectory, potentials):
+    """Frames with the steering hydrogens appended, or None.
+
+    Placed by the potential that steered with them (its _with_hydrogens), so the
+    result is what the run actually steered with, rotamers included.
+    """
+    if not potentials:
+        return None
+    import torch
+
+    for p in potentials:
+        feats = getattr(p, "feats", None) or {}
+        key = getattr(p, "_H_REF_KEY", "")
+        if not (getattr(p, "use_hydrogens", False) and key
+                and feats.get(key) is not None and feats[key][0].shape[-1] > 0):
+            continue
+        # The potentials index hydrogens from the padded width n; the writer
+        # wants them straight after the real atoms.
+        n = int(feats["atom_pad_mask"].shape[1])
+        device = feats[key].device
+        xyz = torch.tensor(trajectory.xyz * 10.0, dtype=torch.float32, device=device)
+        real = xyz.shape[1]
+        xyz = torch.nn.functional.pad(xyz[:, :n], (0, 0, 0, max(0, n - real)))
+        with torch.no_grad():
+            full = p._with_hydrogens(xyz, feats)
+        full = torch.cat((full[:, :real], full[:, n:]), dim=1)
+        return [frame.double().cpu().numpy() for frame in full]
+    return None
+
+
+def _ensure_prepared(potentials, system):
+    """Populate feats on potentials the sampling pipeline prepared elsewhere.
+
+    The sampler's own potential objects are not necessarily the instances the
+    run used: feats comes back None on them, so anything reading
+    p.feats["mmff_hydrogen_ref"] sees nothing. prepare() is idempotent and
+    only does RDKit typing, so calling it here is cheap and safe.
+    """
+    for p in potentials or ():
+        if not getattr(p, "use_hydrogens", False):
+            continue
+        if getattr(p, "feats", None):
+            continue
+        try:
+            p.prepare(system)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not prepare %s for hydrogen output: %s",
+                           type(p).__name__, exc)
+
+
+def _write_hydrogen_mae(trajectory, potentials, out: Path,
+                        system=None, properties=None) -> Path | None:
+    """samples_h.mae: every frame with the steering hydrogens and their bonds.
+
+    The bond table is rebuilt rather than reused: the heavy topology is copied
+    atom for atom and bond for bond, then each reconstructed hydrogen is added
+    to its parent's residue and bonded to it. save_mae takes bond orders from
+    the MDTraj topology when no AllAtomStructure is supplied, so the rebuilt
+    table is what reaches the file.
+    """
+    import mdtraj
+    import numpy as np
+
+    if system is not None:
+        _ensure_prepared(potentials, system)
+    frames = _reconstructed_hydrogens(trajectory, potentials)
+    if frames is None:
+        return None
+    parents = _hydrogen_parents(potentials)
+    if parents is None:
+        return None
+    n_heavy = trajectory.topology.n_atoms
+    n_h = len(frames[0]) - n_heavy
+    if n_h <= 0 or n_h != len(parents):
+        logger.warning("hydrogen count %d does not match %d parents",
+                       n_h, len(parents))
+        return None
+
+    old = trajectory.topology
+    top = mdtraj.Topology()
+    mapping = {}
+    for chain in old.chains:
+        c = top.add_chain()
+        # save_mae takes the mae chain name from chain.chain_id, so it has to be
+        # carried over: a bare add_chain() leaves every atom in a nameless chain
+        # and the ligand then has no chain of its own in samples_h.mae.
+        try:
+            c.chain_id = getattr(chain, "chain_id", None)
+        except AttributeError:          # older mdtraj: chain_id is read-only
+            pass
+        for res in chain.residues:
+            r = top.add_residue(res.name, c, res.resSeq,
+                                getattr(res, "segment_id", ""))
+            for a in res.atoms:
+                mapping[a.index] = top.add_atom(a.name, a.element, r)
+    for bond in old.bonds:
+        kw = {}
+        if getattr(bond, "type", None) is not None:
+            kw["type"] = bond.type
+        if getattr(bond, "order", None) is not None:
+            kw["order"] = bond.order
+        top.add_bond(mapping[bond[0].index], mapping[bond[1].index], **kw)
+
+    hydrogen = mdtraj.core.element.hydrogen
+    for n, parent in enumerate(parents):
+        pa = mapping[int(parent)]
+        ha = top.add_atom(f"H{n + 1}", hydrogen, pa.residue)
+        top.add_bond(pa, ha, order=1)
+
+    xyz = np.stack([np.asarray(f) for f in frames]) / 10.0      # A -> nm
+    traj = mdtraj.Trajectory(xyz, top)
+    path = out / "samples_h.mae"
+    save_mae(traj, path, properties=properties)
+    logger.info("Wrote %d frames with %d reconstructed hydrogens to %s",
+                len(frames), n_h, path)
+    return path
+
+
+def _hydrogen_parents(potentials):
+    """The parent heavy atom of each reconstructed hydrogen, in order."""
+    if not potentials:
+        return None
+    for p in potentials:
+        if not getattr(p, "use_hydrogens", False):
+            continue
+        feats = getattr(p, "feats", None) or {}
+        for rk in ("mmff_hydrogen_ref", "gaff_hydrogen_ref"):
+            r = feats.get(rk)
+            if r is not None and r[0].shape[-1] > 0:
+                return r[0][0].cpu().tolist()
+    return None
+
+
+def _steering_energies(trajectory, potentials, system=None, batch: int = 64):
+    """Each potential's unweighted energy per frame, on the coordinates being written.
+
+    The guidance evaluates these during denoising, but on x_hat_0 of earlier steps; the frame that
+    reaches disk has not been scored, so it is evaluated here. Returns ``(terms, weights)`` where
+    ``terms`` maps a potential's name to a per-frame list and ``weights`` holds its guidance weight at
+    t = 0, or ``None`` when there is nothing to score.
+    """
+    import numpy as np
+    import torch
+
+    if not potentials:
+        return None
+    if system is not None:
+        _ensure_prepared(potentials, system)
+    coords = np.asarray(trajectory.xyz) * 10.0          # nm -> A, as the potentials expect
+    terms: dict[str, list[float]] = {}
+    weights: dict[str, float] = {}
+    for p in potentials:
+        name = type(p).__name__.removesuffix("Potential")
+        try:
+            out: list[float] = []
+            with torch.no_grad():
+                for lo in range(0, len(coords), batch):
+                    x = torch.tensor(coords[lo:lo + batch], dtype=torch.float64)
+                    out.extend(p(x, t=0.0).double().cpu().numpy().tolist())
+            terms[name] = out
+            params = p.compute_parameters(0.0) or {}
+            w = params.get("guidance_weight")
+            weights[name] = float(w) if isinstance(w, (int, float)) else float("nan")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not score %s on the output frames: %s", name, exc)
+    return (terms, weights) if terms else None
+
+
+def _energy_properties(terms, weights):
+    """ct-level MAE properties per frame from :func:`_steering_energies` output."""
+    import math
+
+    names = list(terms)
+    n = len(next(iter(terms.values())))
+    props = []
+    for frame in range(n):
+        entry = {f"r_bioemu2_E_{name}": terms[name][frame] for name in names}
+        entry["r_bioemu2_E_total_unweighted"] = sum(terms[name][frame] for name in names)
+        weighted = sum(terms[name][frame] * weights[name] for name in names
+                       if not math.isnan(weights.get(name, float("nan"))))
+        entry["r_bioemu2_E_total_weighted"] = weighted
+        props.append(entry)
+    return props
+
+
 def write_sampling_output(
     trajectory: mdtraj.Trajectory,
     *,
@@ -594,6 +854,7 @@ def write_sampling_output(
     physicality_filter: PhysicalityFilterMode,
     mae: bool = False,
     cif: bool = False,
+    potentials: Sequence[Potential] | None = None,
 ) -> Path:
     """Write all frames and their physicality results in original order.
 
@@ -611,8 +872,35 @@ def write_sampling_output(
     if cif:
         save_topology_cif(structure, system, trajectory.xyz[0] * 10.0, out / "topology.cif")
     trajectory.save_xtc(str(out / "samples.xtc"))
+    # Score the frames that are written, so each ct carries its own energies and
+    # energies.json records them for every sample.
+    energy_props = None
+    try:
+        scored = _steering_energies(trajectory, potentials, system)
+        if scored is not None:
+            terms, weights = scored
+            energy_props = _energy_properties(terms, weights)
+            (out / "energies.json").write_text(json.dumps(
+                {"terms": list(terms),
+                 "guidance_weight_at_t0": weights,
+                 "unweighted_energy_kcal_per_mol": terms,
+                 "total_unweighted": [p["r_bioemu2_E_total_unweighted"] for p in energy_props],
+                 "total_weighted": [p["r_bioemu2_E_total_weighted"] for p in energy_props]},
+                indent=2))
+            logger.info("Wrote energies.json with %d terms for %d frames",
+                        len(terms), len(energy_props))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not write energies.json: %s", exc)
     if mae:
-        save_mae(trajectory, out / "samples.mae", structure=structure)
+        save_mae(trajectory, out / "samples.mae", structure=structure,
+                 properties=energy_props)
+    # Only when a potential actually reconstructed hydrogens; a
+    # hydrogen=False run writes nothing extra.
+    try:
+        _write_hydrogen_mae(trajectory, potentials, out, system,
+                            properties=energy_props)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not write samples_h.mae: %s", exc)
     report.save(out / "physicality.json")
     failed = len(trajectory) - int(report.passed.sum())
     if failed:
