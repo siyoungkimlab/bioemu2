@@ -176,7 +176,9 @@ def potential_features_from_system(system: System) -> dict[str, torch.Tensor]:
     are irrelevant; ``mode="structure"`` matches ``System.topology``.
     """
     batch = batch_collate([AllAtomStructure.from_system(system, mode="structure")])
-    return build_potential_features(batch, ligand_ccd_codes_from_system(system))
+    return build_potential_features(batch,
+                                   ligand_ccd_codes_from_system(system),
+                                   ligand_smiles_from_system(system))
 
 
 def ligand_ccd_codes_from_system(
@@ -201,9 +203,91 @@ def ligand_ccd_codes_from_system(
     return ccd
 
 
+def ligand_smiles_from_system(system: System | None) -> dict[int, str]:
+    """Map ``{int_asym_id: smiles}`` for the SMILES-specified ligand chains.
+
+    The counterpart of :func:`ligand_ccd_codes_from_system`, numbering chains
+    the same way so the ids line up with ``batch.asym_id``.
+    """
+    if system is None:
+        return {}
+    out: dict[int, str] = {}
+    int_asym_id = 0
+    for entity in system.entities:
+        for _ in entity.asym_ids:
+            if isinstance(entity, Ligand) and getattr(entity, "smiles", None):
+                out[int_asym_id] = entity.smiles
+            int_asym_id += 1
+    return out
+
+
+#: Elements GAFF2 and OpenFF Sage carry parameters for. Anything else -- boron,
+#: silicon, any metal -- has no atom type, so antechamber either fails or
+#: invents one, and the ligand is better left unsteered.
+GAFF_ELEMENTS = frozenset({"H", "C", "N", "O", "F", "P", "S", "Cl", "Br", "I"})
+#: The same set for MMFF: MMFF94 does type silicon and a few metal cations, but
+#: they are left unsteered here too, so all three force fields steer the same
+#: elements and a system's steered atoms do not depend on which one is chosen.
+MMFF_ELEMENTS = GAFF_ELEMENTS
+
+
+def unsupported_ligand_reason(smiles: str, allowed=None) -> str | None:
+    """Why this ligand chain cannot carry force-field terms, or None if it can.
+
+    A monatomic ion or metal (Zn2+, Na+, Cl-) has no bonded terms, no hydrogens
+    to add and no GAFF or MMFF atom type; an element outside ``allowed`` has no
+    parameters either. Callers skip such a chain so the rest of the system is
+    still steered, rather than failing the whole run.
+    """
+    from rdkit.Chem import MolFromSmiles
+
+    mol = MolFromSmiles(smiles)
+    if mol is None:
+        return "RDKit cannot parse the SMILES"
+    if mol.GetNumAtoms() == 1:
+        return "monatomic ion or metal"
+    if allowed is not None:
+        bad = sorted({a.GetSymbol() for a in mol.GetAtoms() if a.GetSymbol() not in allowed})
+        if bad:
+            return "no parameters for " + ", ".join(bad)
+    return None
+
+
+def _mol_from_smiles(smiles: str):
+    """A reference molecule matching the ligand template, with CIP ranks.
+
+    Built as ``RemoveAllHs(AddHs(MolFromSmiles(...)))`` with the template
+    builder's own atom naming, so ``_atom_name_idx_map`` maps it onto the batch.
+    Stereochemistry is assigned explicitly: the constraint builders require
+    ``_CIPRank`` on every atom and skip the molecule silently without it.
+    """
+    from rdkit import Chem
+
+    from bioemu2.structure.templates import _assign_mol_atom_names
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    mol_w_hs = Chem.AddHs(mol)
+    _assign_mol_atom_names(mol_w_hs)
+    out = Chem.RemoveAllHs(mol_w_hs)
+    try:
+        # flagPossibleStereoCenters makes RDKit rank atoms even where nothing
+        # is stereogenic, which is what the chiral builder looks for.
+        Chem.AssignStereochemistry(out, cleanIt=True, force=True,
+                                   flagPossibleStereoCenters=True)
+    except Exception:  # noqa: BLE001
+        return None
+    # An achiral molecule may still carry no CIP ranks, and that is fine: the
+    # chiral builder guards on them itself and returns nothing, while the
+    # geometry, stereo-bond and planarity constraints are all still wanted.
+    return out
+
+
 def build_potential_features(
     batch: BatchAllAtomStructure,
     ligand_ccd_codes: dict[int, str] | None = None,
+    ligand_smiles: dict[int, str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build the feature dictionary consumed by physicality potentials.
 
@@ -222,8 +306,9 @@ def build_potential_features(
     feats["symmetric_chain_index"] = _symmetric_chain_index(feats, batch)
 
     # Tier 2.
-    if ligand_ccd_codes:
-        feats.update(_compute_rdkit_constraint_feats(batch, feats, ligand_ccd_codes))
+    if ligand_ccd_codes or ligand_smiles:
+        feats.update(_compute_rdkit_constraint_feats(
+            batch, feats, ligand_ccd_codes or {}, ligand_smiles or {}))
     else:
         feats.update(_empty_rdkit_feats(batch))
 
@@ -294,6 +379,7 @@ def _compute_rdkit_constraint_feats(
     batch: BatchAllAtomStructure,
     feats: dict[str, torch.Tensor],
     ligand_ccd_codes: dict[int, str],
+    ligand_smiles: dict[int, str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build batched RDKit constraints for every non-polymer residue.
 
@@ -312,9 +398,14 @@ def _compute_rdkit_constraint_feats(
         for atom_lo, atom_hi in _iter_ligand_residues(batch, b, atom_chain[b]):
             chain_int = atom_chain[b, atom_lo].item()  # asym_id/chain_idx
             ccd_code = ligand_ccd_codes.get(chain_int)  # {asym_id/chain_idx: CCD code string}
-            if ccd_code is None:
-                continue
-            ref_mol = ccd.get(ccd_code)  # {ccd_code: rdkit Mol object}
+            if ccd_code is not None:
+                ref_mol = ccd.get(ccd_code)  # {ccd_code: rdkit Mol object}
+            else:
+                # No CCD code: build the reference from the SMILES instead, so
+                # a SMILES ligand gets chiral, stereo, planar and PoseBusters
+                # constraints like any other.
+                smiles = (ligand_smiles or {}).get(chain_int)
+                ref_mol = _mol_from_smiles(smiles) if smiles else None
             if ref_mol is None:
                 continue
             idx_map = _atom_name_idx_map(batch, b, atom_lo, atom_hi, ref_mol)
