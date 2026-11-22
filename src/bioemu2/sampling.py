@@ -73,6 +73,17 @@ def _apply_sampler_params(sampler: Sampler, params: dict | None) -> Sampler:
     return sampler
 
 
+#: Physicality potentials the ligand presets leave out: they hold bond and angle
+#: geometry at 10-50x the force field's own weights, so they override the terms
+#: the ligand force field provides.
+_LIGAND_PRESET_DROP = ("PoseBustersPotential", "BondLengthPotential", "BondAnglePotential")
+
+
+def _drop_overriding_physicality(potentials):
+    """The preset's potentials without the three that override the ligand force field."""
+    return tuple(p for p in potentials if type(p).__name__ not in _LIGAND_PRESET_DROP)
+
+
 def _ligand_sampler_kw() -> dict:
     """Sampler settings shared by the ligand force-field presets."""
     from bioemu2.denoising.steering.potentials import (
@@ -149,7 +160,8 @@ def sampler_from_preset(
         sampler = GuidedFKSampler(step_scale=step_scale, **_ligand_sampler_kw())
         if potentials is None:
             from bioemu2.denoising.steering.potentials import get_mmff_potentials
-            potentials = get_mmff_potentials(**_ligand_potential_kw("mmff"))
+            potentials = _drop_overriding_physicality(
+                get_mmff_potentials(**_ligand_potential_kw("mmff")))
     elif preset in GAFF_PRESETS:
         # The GAFF2 counterpart of the mmff preset: the ligand force field's own
         # bond and angle constants, the nonbonded term on, and the per-term
@@ -157,8 +169,8 @@ def sampler_from_preset(
         sampler = GuidedFKSampler(step_scale=step_scale, **_ligand_sampler_kw())
         if potentials is None:
             from bioemu2.denoising.steering.potentials import get_gaff_potentials
-            potentials = get_gaff_potentials(ligand_ff=preset,
-                                             **_ligand_potential_kw(preset))
+            potentials = _drop_overriding_physicality(
+                get_gaff_potentials(ligand_ff=preset, **_ligand_potential_kw(preset)))
     else:
         raise ValueError(
             f"Unknown sampler preset: {preset}. Choose from: "
