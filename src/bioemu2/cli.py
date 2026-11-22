@@ -22,7 +22,11 @@ from bioemu2.conditioning.method import SamplingMode
 from bioemu2.context_parallel import api as cp_api
 from bioemu2.data_interface import Contact, System, convert_boltz, load_system_and_contacts
 from bioemu2.denoising.samplers import Sampler
-from bioemu2.denoising.steering.potentials import Potential
+from bioemu2.denoising.steering.potentials import (
+    Potential,
+    get_default_potentials,
+    get_mmff_potentials,
+)
 from bioemu2.mae import save_mae
 from bioemu2.model import load_model
 from bioemu2.msa.alignment import get_msa
@@ -47,7 +51,10 @@ PHYSICALITY_FRAME_CHUNK_SIZE = 32
 
 
 def _sampler(
-    preset: str, potentials: Path | None, *, mode: SamplingMode = "equilibrium"
+    preset: str, potentials: Path | None, params: tuple[str, ...] = (),
+    sampler_params: tuple[str, ...] = (),
+    ff_params: tuple[str, ...] = (), *,
+    mode: SamplingMode = "equilibrium"
 ) -> Sampler:
     """Build the sampler for ``--sampler PRESET [--potentials YAML]``.
 
@@ -55,13 +62,387 @@ def _sampler(
     ``potentials`` points to a YAML with a top-level ``potentials:`` list and
     replaces that default list.
     """
-    return sampler_from_preset(preset, mode=mode, potentials=_load_potentials(preset, potentials))
+    return sampler_from_preset(preset, mode=mode, potentials=_load_potentials(preset, potentials, params,
+                                                   ff_params),
+        sampler_params=_parse_sampler_params(sampler_params))
 
 
-def _load_potentials(preset: str, path: Path | None) -> Sequence[Potential] | None:
+#: Presets that carry potentials, so -P and --potentials apply to them.
+_STEERING_PRESETS = ("edm_gd", "edm_fk", "edm_fkc", "mmff", "gaff2", "openff-2.2.1")
+
+#: Presets that carry a force field, so -F applies to them.
+_FORCEFIELD_PRESETS = ("mmff", "gaff2", "openff-2.2.1")
+#: Presets built from get_gaff_potentials; the name is the ligand force field.
+_GAFF_PRESETS = ("gaff2", "openff-2.2.1")
+
+#: What --sampler gaff2 builds, mirroring the preset in sampling.py so an -F
+#: override can be merged over it instead of over the factory's plain GAFF
+#: defaults (uniform_k=True, nonbonded=False). Kept here rather than
+#: duplicated: _gaff2_preset_kw() reads GAFF2_WEIGHT at call time.
+def _gaff2_preset_kw() -> dict:
+    from bioemu2.denoising.steering.potentials import GAFF2_WEIGHT
+
+    return {
+        "hydrogen": True,
+        "bond_uniform_k": False,
+        "angle_uniform_k": False,
+        "angle_cutoff": 0.35,
+        "nonbonded": True,
+        "bond_weight": GAFF2_WEIGHT,
+        "angle_weight": GAFF2_WEIGHT,
+        "torsion_weight": GAFF2_WEIGHT,
+        "pair14_weight": GAFF2_WEIGHT,
+        "nonbonded_weight": GAFF2_WEIGHT,
+    }
+
+
+
+#: Sampler fields that may be overridden. Unlike the potential parameters
+#: these ARE preset-dependent, so the binding check is against the built
+#: sampler's dataclass fields inside sampler_from_preset; this table is for
+#: the help text and for catching typos before the model loads.
+_SAMPLER_FIELDS: dict[str, str] = {
+    "num_steps": "all",
+    "step_scale": "edm, edm_gd, edm_fk",
+    "noise_scale": "edm, edm_gd, edm_fk",
+    "resampling_interval": "edm_gd, edm_fk, edm_fkc (none disables)",
+    "resampling_group_size": "edm_gd, edm_fk, edm_fkc",
+    "fk_lambda": "edm_gd, edm_fk",
+    "num_gd_steps": "edm_gd, edm_fk",
+    "max_step": "edm_gd, edm_fk (A per atom per guidance step; none = uncapped)",
+    "langevin_kT": "edm_gd, edm_fk (kcal/mol; Langevin guidance, none = plain descent)",
+    "langevin_weight": "edm_gd, edm_fk (guidance weight w of the noise sqrt(2 w kT))",
+    "langevin_t_on": "edm_gd, edm_fk (Langevin noise only for t <= this)",
+    "ess_threshold": "edm_fkc",
+    "beta_power": "edm_fkc",
+    "gamma_0": "edm_fkc",
+    "gamma_min": "edm_fkc",
+}
+
+
+def _parse_sampler_params(values: tuple[str, ...]) -> dict:
+    """``("resampling_interval=5",)`` -> ``{"resampling_interval": 5}``.
+
+    ``none`` becomes None, which is meaningful for resampling_interval: it
+    disables FK weighting and resampling, so ``--sampler edm_fk -S
+    resampling_interval=none`` is edm_gd.
+    """
+    out: dict = {}
+    for item in values:
+        if "=" not in item:
+            raise ValueError(f"--sampler-param expects field=value, got {item!r}")
+        key, _, raw = item.partition("=")
+        key, raw = key.strip(), raw.strip()
+        if key not in _SAMPLER_FIELDS:
+            raise ValueError(f"unknown sampler field {key!r}. Valid: "
+                             + ", ".join(sorted(_SAMPLER_FIELDS)))
+        if raw.lower() in ("none", "null"):
+            out[key] = None
+            continue
+        try:
+            out[key] = int(raw) if raw.lstrip("-").isdigit() else float(raw)
+        except ValueError:
+            raise ValueError(f"--sampler-param {key} needs a number or "
+                             f"'none', got {raw!r}") from None
+    return out
+
+
+#: ``term.param`` -> the get_mmff_potentials keyword it sets.
+#: ``all.weight`` is special-cased: it sets every term's weight at once,
+#: which is what preserves the force field's internal balance.
+_FORCEFIELD_PARAMS: dict[str, str] = {
+    "bond.weight": "bond_weight",
+    "angle.weight": "angle_weight",
+    "torsion.weight": "torsion_weight",
+    "pairs14.weight": "pair14_weight",
+    "stretchbend.weight": "stretchbend_weight",
+    "nonbonded.weight": "nonbonded_weight",
+    # Global, not per-term: one kwarg feeds every HydrogenMixin
+    # consumer. The models predict heavy atoms only, and the
+    # heavy-only torsion path has the wrong shape, not merely a
+    # smaller amplitude, so this is an ablation rather than a
+    # speed knob.
+    "hydrogen": "hydrogen",
+    # On/off per term. get_mmff_potentials gates construction on
+    # these, so a disabled term is never built or prepared.
+    "bond.enabled": "bond",
+    "angle.enabled": "angle",
+    "torsion.enabled": "torsion",
+    "pairs14.enabled": "pairs14",
+    "stretchbend.enabled": "stretchbend",
+    "nonbonded.enabled": "nonbonded",
+    "bond.uniform_k": "bond_uniform_k",
+    "angle.uniform_k": "angle_uniform_k",
+    # Realistic nonbonded, opt-in: real Coulomb and the force field's own
+    # LJ, each with a parabola core inside max(sigma/2, 0.5 A) (R* for
+    # MMFF); D, the dielectric of that Coulomb; and t_on, so the 1-4 and
+    # nonbonded terms act only late in denoising (t <= t_on, t = 0 clean).
+    # vdW core switch, as a fraction of sigma (GAFF2/OpenFF, default 0.7) or R*
+    # (MMFF, default 0.5); the Coulomb core stays at half.
+    "lj_core.switch": "lj_core_switch",
+    # Coulomb core switch, as a fraction of sigma / R* (default 0.5).
+    "coulomb_core.switch": "coulomb_core_switch",
+    # Bond Huber cutoff in A (default 0.2): quadratic within, linear beyond.
+    "bond.cutoff": "bond_cutoff",
+    # Dielectric D of the real Coulomb: dielectric sets the 1-4 and nonbonded terms together;
+    # pairs14.dielectric / nonbonded.dielectric set one term alone (default: dielectric).
+    # Before 2026-11-21 nonbonded.dielectric set both terms (now: dielectric).
+    "dielectric": "dielectric",
+    "pairs14.dielectric": "pairs14_dielectric",
+    "nonbonded.dielectric": "nonbonded_dielectric",
+    "nonbonded.t_on": "nonbonded_t_on",
+    # Every force-field term acts only for t <= t_on (default 0.4; 1 = always).
+    "t_on": "t_on",
+    # Guidance weight ramps linearly from 0 at t = 1 to its value at t = 0.
+    "guidance.ramp": "guidance_ramp",
+}
+
+#: Keys that select a term's force constants rather than scale it.
+_FORCEFIELD_FLAGS = frozenset({
+    "bond.uniform_k", "angle.uniform_k", "hydrogen",
+    "bond.enabled", "angle.enabled", "torsion.enabled",
+    "pairs14.enabled", "stretchbend.enabled", "nonbonded.enabled",
+    "guidance.ramp",
+})
+
+#: The six MMFF energy functions, for ``-F terms=``.
+_ALL_TERMS = ("bond", "angle", "torsion", "pairs14", "stretchbend",
+              "nonbonded")
+
+
+#: Every weight, for ``all.weight``. The superset over both force fields:
+#: stretchbend_weight is MMFF-only, so the expansion is filtered against the
+#: target factory by _weights_for() rather than passed blind.
+_ALL_WEIGHTS = ("bond_weight", "angle_weight", "torsion_weight",
+                "pair14_weight", "stretchbend_weight", "nonbonded_weight")
+
+
+def _weights_for(factory) -> tuple[str, ...]:
+    """The _ALL_WEIGHTS a given factory actually accepts.
+
+    Read from the signature, not a second list: GAFF has no stretch-bend, and
+    hard-coding which weights each factory has is how all.weight came to pass
+    stretchbend_weight to get_gaff_potentials.
+    """
+    import inspect
+
+    params = inspect.signature(factory).parameters
+    return tuple(w for w in _ALL_WEIGHTS if w in params)
+
+
+def _parse_forcefield_params(values: tuple[str, ...],
+                             factory=None) -> dict:
+    """``("bond.weight=0.001",)`` -> ``{"bond_weight": 0.001}``.
+
+    ``factory`` restricts an ``all.weight`` expansion to the
+    weights that factory has; without it the full superset is
+    used, which is MMFF's shape.
+    """
+    out: dict = {}
+    values_seen: list[str] = []
+    for item in values:
+        if "=" not in item:
+            raise ValueError(
+                f"--forcefield-param expects term.param=value, got {item!r}")
+        key, _, raw = item.partition("=")
+        key, raw = key.strip(), raw.strip()
+        values_seen.append(key)
+        if key == "terms":
+            # A whitelist: named terms on, everything else off, so one key
+            # fully determines the set.
+            want = {w.strip() for w in raw.split(",") if w.strip()}
+            unknown = want - set(_ALL_TERMS)
+            if unknown:
+                raise ValueError(
+                    f"unknown term(s) {sorted(unknown)}. Valid: "
+                    + ", ".join(_ALL_TERMS))
+            for term in _ALL_TERMS:
+                out[term] = term in want
+            continue
+        if key == "all.weight":
+            try:
+                v = float(raw)
+            except ValueError:
+                raise ValueError(
+                    f"--forcefield-param all.weight needs a number, "
+                    f"got {raw!r}") from None
+            if v < 0.0:
+                raise ValueError("all.weight must not be negative")
+            # The target factory's weights, not the superset: GAFF
+            # has no stretch-bend term.
+            for name in (_weights_for(factory) if factory is not None
+                         else _ALL_WEIGHTS):
+                out[name] = v
+            continue
+        if key not in _FORCEFIELD_PARAMS:
+            raise ValueError(
+                f"unknown force-field parameter {key!r}. Valid: terms, all.weight, "
+                + ", ".join(sorted(_FORCEFIELD_PARAMS))
+            )
+        if key in _FORCEFIELD_FLAGS:
+            low = raw.lower()
+            if low in ("1", "true", "yes", "on"):
+                out[_FORCEFIELD_PARAMS[key]] = True
+            elif low in ("0", "false", "no", "off"):
+                out[_FORCEFIELD_PARAMS[key]] = False
+            else:
+                raise ValueError(
+                    f"--forcefield-param {key} is a flag: use 0/1 or "
+                    f"true/false, got {raw!r}")
+            continue
+        try:
+            v = float(raw)
+        except ValueError:
+            raise ValueError(
+                f"--forcefield-param {key} needs a number, got {raw!r}"
+            ) from None
+        if v < 0.0:
+            raise ValueError(f"--forcefield-param {key} must not be negative")
+        if key.endswith("dielectric") and v == 0.0:
+            raise ValueError(f"--forcefield-param {key} must be positive")
+        if key in ("nonbonded.t_on", "t_on") and v > 1.0:
+            raise ValueError(f"--forcefield-param {key} is a diffusion time in [0, 1]")
+        out[_FORCEFIELD_PARAMS[key]] = v
+    # The factory builds the nonbonded term only when nonbonded is
+    # true, so setting nonbonded.weight on its own would have been a
+    # silent no-op. Asking for any nonbonded parameter switches it on.
+    # Asking for any nonbonded parameter implies the term, unless
+    # nonbonded.enabled said otherwise -- setdefault leaves an
+    # explicit value alone.
+    if any(k.startswith("nonbonded.") for k in values_seen):
+        out.setdefault("nonbonded", True)
+    return out
+
+
+#: ``Potential.param`` -> the get_default_potentials keyword it sets.
+#: Keys are the potential CLASS NAMES as they appear in that function, so the
+#: CLI vocabulary matches the code's. Only scalar parameters appear here: the
+#: PiecewiseStepFunction weights and SymmetricChainCOM's
+#: ExponentialInterpolation buffer are noise-level schedules, and taking a
+#: float for them would quietly replace a schedule with a constant.
+_POTENTIAL_PARAMS: dict[str, str] = {
+    "PoseBusters.weight": "pose_weight",
+    "PoseBusters.bond_buffer": "bond_buffer",
+    "PoseBusters.angle_buffer": "pose_angle_buffer",
+    "PoseBusters.clash_buffer": "clash_buffer",
+    "ChiralAtom.weight": "chiral_weight",
+    "ChiralAtom.buffer": "chiral_buffer",
+    "StereoBond.weight": "stereo_weight",
+    "StereoBond.buffer": "stereo_buffer",
+    "PlanarBond.weight": "planar_weight",
+    "PlanarBond.buffer": "planar_buffer",
+    "BondLength.weight": "bond_length_weight",
+    "BondLength.sigma": "bond_length_sigma",
+    "BondAngle.weight": "bond_angle_weight",
+    "BondAngle.sigma": "bond_angle_sigma",
+}
+
+#: Shipped values, for error messages and documentation.
+_POTENTIAL_DEFAULTS: dict[str, str] = {
+    "PoseBusters.weight": "0.10",
+    "PoseBusters.bond_buffer": "0.20",
+    "PoseBusters.angle_buffer": "0.20",
+    "PoseBusters.clash_buffer": "0.15",
+    "ChiralAtom.weight": "0.20",
+    "ChiralAtom.buffer": "0.52360 rad (30 deg)",
+    "StereoBond.weight": "0.10",
+    "StereoBond.buffer": "0.52360 rad (30 deg)",
+    "PlanarBond.weight": "0.10",
+    "PlanarBond.buffer": "0.26180 rad (15 deg)",
+    "BondLength.weight": "0.05",
+    "BondLength.sigma": "10.0",
+    "BondAngle.weight": "0.05",
+    "BondAngle.sigma": "10.0",
+}
+
+
+def _parse_potential_params(values: tuple[str, ...]) -> dict:
+    """``("ChiralAtom.buffer=0",)`` -> ``{"chiral_buffer": 0.0}``."""
+    out: dict = {}
+    for item in values:
+        if "=" not in item:
+            raise ValueError(
+                f"--potential-param expects Name.param=value, got {item!r}"
+            )
+        key, _, raw = item.partition("=")
+        key, raw = key.strip(), raw.strip()
+        if key not in _POTENTIAL_PARAMS:
+            matches = [k for k in _POTENTIAL_PARAMS
+                       if k.split(".")[0].lower() == key.split(".")[0].lower()]
+            hint = (f" Did you mean one of: {', '.join(sorted(matches))}?"
+                    if matches else
+                    f" Valid keys: {', '.join(sorted(_POTENTIAL_PARAMS))}.")
+            raise ValueError(f"unknown potential parameter {key!r}.{hint}")
+        try:
+            number = float(raw)
+        except ValueError:
+            raise ValueError(
+                f"--potential-param {key} needs a number, got {raw!r}"
+            ) from None
+        if number < 0.0:
+            raise ValueError(f"--potential-param {key} must not be negative")
+        out[_POTENTIAL_PARAMS[key]] = number
+    return out
+
+
+def _load_potentials(preset: str, path: Path | None,
+                     params: tuple[str, ...] = (),
+                     ff_params: tuple[str, ...] = (),
+                     ) -> Sequence[Potential] | None:
+    overrides = _parse_potential_params(params)
+    # Which factory the flags are headed for decides what all.weight
+    # expands to: GAFF has no stretch-bend term.
+    if preset in _GAFF_PRESETS:
+        from bioemu2.denoising.steering.potentials import (
+            get_gaff_potentials as _ff_factory,
+        )
+    else:
+        from bioemu2.denoising.steering.potentials import (
+            get_mmff_potentials as _ff_factory,
+        )
+    ff = _parse_forcefield_params(ff_params, factory=_ff_factory)
+    if ff and preset not in _FORCEFIELD_PRESETS:
+        raise ValueError(
+            "--forcefield-param requires a force-field sampler "
+            f"(mmff, gaff2); --sampler {preset} carries no force field"
+        )
     if path is None:
-        return None
-    if preset not in ("edm_gd", "edm_fk", "edm_fkc"):
+        if not overrides and not ff:
+            return None          # unchanged: the sampler uses its own default
+        if preset not in _STEERING_PRESETS:
+            raise ValueError(
+                "--potential-param requires a steering sampler (edm_gd, "
+                f"edm_fk, edm_fkc); --sampler {preset} is unsteered, so it "
+                "has no potentials to configure"
+            )
+        # The shipped set with the named parameters replaced; everything else
+        # keeps its default, so this equals the preset's own potentials when
+        # nothing is overridden.
+        # mmff carries ligand terms as well, and get_mmff_potentials
+        # forwards the physicality parameters, so -P applies to both.
+        if preset == "mmff":
+            # hydrogen defaults on here but an -F override wins,
+            # so merge rather than pass it explicitly.
+            kw = {"hydrogen": True, **overrides, **ff}
+            return tuple(get_mmff_potentials(**kw))
+        if preset in _GAFF_PRESETS:
+            # Same merge, over the gaff2 preset's own defaults: without them
+            # an -F flag would fall back to the factory's GAFF defaults,
+            # which are uniform_k=True and nonbonded=False -- not gaff2.
+            # openff-2.2.1 is the same preset with OpenFF's parameters.
+            from bioemu2.denoising.steering.potentials import (
+                get_gaff_potentials,
+            )
+            kw = {**_gaff2_preset_kw(), "ligand_ff": preset, **overrides, **ff}
+            return tuple(get_gaff_potentials(**kw))
+        return tuple(get_default_potentials(**overrides))
+    if overrides:
+        raise ValueError(
+            "--potentials replaces the physicality set entirely, so it cannot "
+            "be combined with --potential-param; set the values inside the "
+            "YAML instead"
+        )
+    if preset not in _STEERING_PRESETS:
         raise ValueError("--potentials requires a steering sampler (edm_gd, edm_fk, edm_fkc)")
     config = OmegaConf.load(path)
     if not isinstance(config, DictConfig) or "potentials" not in config:
@@ -149,6 +530,77 @@ def _common_options(function: Callable) -> Callable:
             metavar="YAML",
             help="Path to a YAML file containing a top-level 'potentials' list. This replaces "
             "the default physicality potentials and requires edm_gd, edm_fk, or edm_fkc.",
+        ),
+        click.option(
+            "-S",
+            "--sampler-param",
+            "sampler_param",
+            multiple=True,
+            metavar="FIELD=VALUE",
+            help="Change one sampler field, keeping the preset's other "
+            "values. Repeatable. These are preset-specific: "
+            "resampling_interval and resampling_group_size on edm_gd, "
+            "edm_fk and edm_fkc; fk_lambda, num_gd_steps, max_step (A per atom per guidance step) and "
+            "langevin_kT / langevin_weight / langevin_t_on (Langevin guidance) on edm_gd "
+            "and edm_fk; ess_threshold, beta_power, gamma_0 and "
+            "gamma_min on edm_fkc. 'none' is accepted where None is "
+            "meaningful, so -S resampling_interval=none turns edm_fk "
+            "into edm_gd.",
+        ),
+        click.option(
+            "-F",
+            "--forcefield-param",
+            "forcefield_param",
+            multiple=True,
+            metavar="TERM.PARAM=VALUE",
+            help="Change one force-field parameter. Repeatable, and "
+            "requires a force-field sampler. terms=bond,angle,torsion "
+            "chooses the energy functions in one key: named terms on, "
+            "unnamed off. "
+            "requires a force-field sampler such as --sampler mmff. "
+            "Keys: bond.weight, angle.weight, torsion.weight, "
+            "pairs14.weight, stretchbend.weight, nonbonded.weight, "
+            "bond.enabled, angle.enabled, torsion.enabled, "
+            "pairs14.enabled, stretchbend.enabled, "
+            "nonbonded.enabled to choose terms (MMFF's stretch-bend is off "
+            "by default because it is unbounded below; "
+            "stretchbend.enabled=1 turns it on), and "
+            "bond.uniform_k / angle.uniform_k which take 0 or 1 and "
+            "choose between the force field's own constants and "
+            "k = 1. The 1-4 and nonbonded terms are real Coulomb and the "
+            "force field's own Lennard-Jones, each with a smooth core inside "
+            "max(F sigma, 0.5 A). dielectric=D sets both terms, pairs14.dielectric "
+            "and nonbonded.dielectric one term alone (default: dielectric); "
+            "lj_core.switch=F moves the vdW core to "
+            "max(F sigma, 0.5 A) (F sigma = F R* for MMFF; default 0.7 for "
+            "gaff2/openff, 0.5 for mmff); coulomb_core.switch=F does the same "
+            "for the Coulomb core (default 0.5). bond.cutoff=C sets the bond "
+            "terms' Huber cutoff in A (default 0.2). t_on=T applies every force-field term "
+            "(guidance and resampling) only for t <= T (t = 1 noise, 0 "
+            "clean; default 0.4, 1 for always); nonbonded.t_on=T delays "
+            "the 1-4 and nonbonded terms further. guidance.ramp=1 makes "
+            "every force-field guidance weight rise linearly from 0 at t = 1 "
+            "to its value at t = 0 (resampling keeps t_on). "
+            "all.weight sets every term at once, which is "
+            "what keeps the force field's internal balance: setting "
+            "terms individually changes it.",
+        ),
+        click.option(
+            "-P",
+            "--potential-param",
+            "potential_param",
+            multiple=True,
+            metavar="NAME.PARAM=VALUE",
+            help="Change one physicality parameter, keeping every other shipped "
+            "value. Repeatable. Keys are the potential class names: "
+            "PoseBusters.weight/.bond_buffer/.angle_buffer/.clash_buffer, "
+            "ChiralAtom.weight/.buffer, StereoBond.weight/.buffer, "
+            "PlanarBond.weight/.buffer, BondLength.weight/.sigma, "
+            "BondAngle.weight/.sigma. Buffers are radians for the dihedral "
+            "terms and fractions for PoseBusters; sigma is sigma_tolerance. "
+            "Requires a steering sampler, and cannot be combined with "
+            "--potentials. Example: -P ChiralAtom.buffer=0 enforces the sign "
+            "of each centre without demanding a minimum improper.",
         ),
         click.option(
             "--mae",
@@ -330,6 +782,89 @@ def validate_x0(trajectory: mdtraj.Trajectory, system: System) -> mdtraj.Traject
     return trajectory
 
 
+def _write_parameters(out: Path, sampler) -> None:
+    """Record every resolved parameter, with the CLI key that sets it.
+
+    Values are read back off the constructed objects, not re-derived from the
+    flags, so what is written is what will actually be used.
+    """
+    import dataclasses
+
+    out.mkdir(parents=True, exist_ok=True)
+    pot_key = {v: k for k, v in _POTENTIAL_PARAMS.items()}
+    ff_key = {v: k for k, v in _FORCEFIELD_PARAMS.items()}
+
+    lines: list[str] = [
+        "# Every parameter in effect for this run, read off the constructed",
+        "# objects. The 'cli' field is the flag that sets it; a blank one is",
+        "# not reachable from the command line.",
+        "sampler:",
+        f"  class: {type(sampler).__name__}",
+    ]
+    try:
+        for f in sorted(dataclasses.fields(sampler), key=lambda x: x.name):
+            if f.name == "potentials":
+                continue
+            v = getattr(sampler, f.name)
+            cli = f"-S {f.name}" if f.name in _SAMPLER_FIELDS else ""
+            lines.append(f"  {f.name}: {v!r}"
+                         + (f"            # {cli}" if cli else ""))
+    except TypeError:
+        lines.append("  (not a dataclass)")
+
+    lines.append("potentials:")
+    for p in getattr(sampler, "potentials", ()) or ():
+        lines.append(f"  - class: {type(p).__name__}")
+        params = getattr(p, "parameters", None) or {}
+        # MMFFBondPotential -> "bond", so the -F keys (bond.weight,
+        # torsion.weight, ...) match. MMFF14Potential -> "pairs14".
+        stem = type(p).__name__.replace("Potential", "").lower()
+        for ff in ("mmff", "gaff"):
+            if stem.startswith(ff) and stem != ff:
+                stem = stem[len(ff):]
+        if stem == "14":
+            stem = "pairs14"
+        for k in sorted(params):
+            # Keys are Class.param. Several potentials store a parameter under
+            # the same name -- ChiralAtom, StereoBond and PlanarBond all use
+            # "buffer" -- so the class has to pick the key, not the name.
+            suffix = "weight" if k == "guidance_weight" else k
+            cli = next((c for c in list(_POTENTIAL_PARAMS)
+                        + list(_FORCEFIELD_PARAMS)
+                        if c.split(".")[0].lower() == stem
+                        and c.split(".", 1)[1] == suffix), "")
+            if not cli:
+                cli = pot_key.get(k, "")
+            flag = "-F" if cli in _FORCEFIELD_PARAMS else "-P"
+            notes = [f"{flag} {cli}"] if cli else []
+            describe = getattr(params[k], "describe", None)
+            if callable(describe) and describe():
+                notes.append(describe())
+            lines.append(f"      {k}: {params[k]!r}"
+                         + (f"        # {'; '.join(notes)}" if notes else ""))
+        for attr in ("uniform_k", "use_hydrogens", "cutoff", "sigma_tolerance",
+                     "lj_core_switch", "coulomb_core_switch", "dielectric", "t_on",
+                     "nonbonded_t_on", "guidance_ramp", "ligand_ff"):
+            if hasattr(p, attr):
+                cli = ff_key.get(attr, "")
+                lines.append(f"      {attr}: {getattr(p, attr)!r}"
+                             + (f"        # -F {cli}" if cli else ""))
+
+    lines.append("available_keys:")
+    lines.append("  potential (-P):")
+    for k in sorted(_POTENTIAL_PARAMS):
+        lines.append(f"    - {k}")
+    lines.append("  forcefield (-F):")
+    lines.append("    - all.weight")
+    for k in sorted(_FORCEFIELD_PARAMS):
+        lines.append(f"    - {k}")
+    lines.append("  sampler (-S):")
+    for k, where in sorted(_SAMPLER_FIELDS.items()):
+        lines.append(f"    - {k}    # {where}")
+
+    (out / "parameters.yaml").write_text("\n".join(lines) + "\n")
+
+
 def _write_command(out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / "command.txt").write_text(shlex.join(sys.argv) + "\n")
@@ -397,6 +932,9 @@ def sample_equilibrium_command(
     num_steps: int | None,
     sampler: str,
     potentials: Path | None,
+    potential_param: tuple[str, ...],
+    forcefield_param: tuple[str, ...],
+    sampler_param: tuple[str, ...],
     precision: str,
     physicality_filter: str,
     mae: bool,
@@ -412,8 +950,16 @@ def sample_equilibrium_command(
         checkpoint_path=checkpoint_path,
         checkpoint_cache_dir=checkpoint_cache_dir,
     )
-    resolved_potentials = _load_potentials(sampler, potentials)
+    resolved_potentials = _load_potentials(sampler, potentials, potential_param,
+                                       forcefield_param)
     _write_command(out)
+    try:
+        _write_parameters(out, _sampler(sampler, potentials, potential_param,
+                                        sampler_param, forcefield_param,
+                                        mode="equilibrium"))
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "could not write parameters.yaml: %s", exc)
     model = load_model(
         checkpoint=resolved_checkpoint,
         checkpoint_path=checkpoint_path,
@@ -431,6 +977,7 @@ def sample_equilibrium_command(
         sampler=cast(SamplerPreset, sampler),
         num_steps=num_steps,
         potentials=resolved_potentials,
+        sampler_params=_parse_sampler_params(sampler_param),
         seed=seed,
         output_dir=out,
         physicality_mode=physicality_filter,
@@ -468,6 +1015,9 @@ def predict_structure_command(
     cif: bool,
     compile_denoiser: bool,
     matmul_precision: str | None,
+    potential_param: tuple[str, ...] = (),
+    forcefield_param: tuple[str, ...] = (),
+    sampler_param: tuple[str, ...] = (),
 ) -> None:
     """Predict the folded structure."""
     resolved_system, contacts, resolved_checkpoint = _resolve_common(
@@ -477,8 +1027,16 @@ def predict_structure_command(
         checkpoint_path=checkpoint_path,
         checkpoint_cache_dir=checkpoint_cache_dir,
     )
-    resolved_potentials = _load_potentials(sampler, potentials)
+    resolved_potentials = _load_potentials(sampler, potentials, potential_param,
+                                       forcefield_param)
     _write_command(out)
+    try:
+        _write_parameters(out, _sampler(sampler, potentials, potential_param,
+                                        sampler_param, forcefield_param,
+                                        mode="structure"))
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "could not write parameters.yaml: %s", exc)
     model = load_model(
         checkpoint=resolved_checkpoint,
         checkpoint_path=checkpoint_path,
@@ -496,6 +1054,7 @@ def predict_structure_command(
         sampler=cast(SamplerPreset, sampler),
         num_steps=num_steps,
         potentials=resolved_potentials,
+        sampler_params=_parse_sampler_params(sampler_param),
         seed=seed,
         output_dir=out,
         physicality_mode=physicality_filter,
@@ -558,6 +1117,9 @@ def propagate_command(
     cif: bool,
     compile_denoiser: bool,
     matmul_precision: str | None,
+    potential_param: tuple[str, ...] = (),
+    forcefield_param: tuple[str, ...] = (),
+    sampler_param: tuple[str, ...] = (),
 ) -> None:
     """Sample endpoints at a time lag from a CIF or each frame of an XTC.
 
@@ -590,7 +1152,8 @@ def propagate_command(
         checkpoint_cache_dir=checkpoint_cache_dir,
         x0_cif=x0_cif,
     )
-    resolved_sampler = _sampler(sampler, potentials)
+    resolved_sampler = _sampler(sampler, potentials, potential_param, sampler_param,
+                               forcefield_param)
     if num_steps is not None:
         resolved_sampler.num_steps = num_steps
     if x0_xtc is not None:
@@ -603,6 +1166,13 @@ def propagate_command(
         x0 = x0[[0] * num_samples]
     x0 = validate_x0(x0, resolved_system)
     _write_command(out)
+    try:
+        _write_parameters(out, _sampler(sampler, potentials, potential_param,
+                                        sampler_param, forcefield_param,
+                                        mode="equilibrium"))
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "could not write parameters.yaml: %s", exc)
     model = load_model(
         checkpoint=resolved_checkpoint,
         checkpoint_path=checkpoint_path,
@@ -680,6 +1250,9 @@ def _run_cp_sampling_command(
     precision: str,
     matmul_precision: str | None,
     physicality_filter: str,
+    potential_param: tuple[str, ...] = (),
+    forcefield_param: tuple[str, ...] = (),
+    sampler_param: tuple[str, ...] = (),
 ) -> None:
     with cp_api.session():
         resolved: list[
@@ -694,9 +1267,17 @@ def _run_cp_sampling_command(
                 checkpoint_cache_dir=checkpoint_cache_dir,
             )
             resolved_system, contacts, resolved_checkpoint = rank0_resolved
-            resolved_potentials = _load_potentials(sampler, potentials)
+            resolved_potentials = _load_potentials(sampler, potentials, potential_param,
+                                       forcefield_param)
             resolved[0] = (resolved_system, contacts, resolved_potentials, resolved_checkpoint)
             _write_command(out)
+            try:
+                _write_parameters(out, _sampler(sampler, potentials, potential_param,
+                                                sampler_param, forcefield_param,
+                                                mode="equilibrium"))
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "could not write parameters.yaml: %s", exc)
         dist.broadcast_object_list(resolved, src=0)
         assert resolved[0] is not None
         resolved_system, contacts, resolved_potentials, resolved_checkpoint = resolved[0]
@@ -719,6 +1300,7 @@ def _run_cp_sampling_command(
             sampler=cast(SamplerPreset, sampler),
             num_steps=num_steps,
             potentials=resolved_potentials,
+            sampler_params=_parse_sampler_params(sampler_param),
             seed=seed,
             output_dir=out,
             physicality_mode=physicality_filter,

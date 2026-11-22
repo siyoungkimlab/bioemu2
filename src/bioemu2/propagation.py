@@ -59,6 +59,7 @@ def simulate_trajectory(
     contacts: list[Contact] | None = None,
     batch_size: int | None = None,
     sampler: SamplerPreset = "edm",
+    sampler_params: dict | None = None,
     seed: int | None = None,
     display_propagation_progress: bool = True,
 ) -> list[mdtraj.Trajectory]:
@@ -89,7 +90,8 @@ def simulate_trajectory(
     """
     if num_trajectory_steps < 1:
         raise ValueError("num_trajectory_steps must be a positive integer.")
-    configured_sampler = sampler_from_preset(sampler, mode="equilibrium")
+    configured_sampler = sampler_from_preset(sampler, mode="equilibrium",
+                                            sampler_params=sampler_params)
     if (
         getattr(configured_sampler, "resampling_interval", None) is not None
         or getattr(configured_sampler, "ess_threshold", None) is not None
@@ -304,6 +306,7 @@ def propagate(
     contacts: list[Contact] | None = None,
     batch_size: int | None = None,
     sampler: SamplerPreset = "edm",
+    sampler_params: dict | None = None,
     seed: int | None = None,
     progress: bool = True,
 ) -> mdtraj.Trajectory:
@@ -358,7 +361,8 @@ def propagate(
         if x0.n_frames != 1:
             raise ValueError("num_samples requires a CIF path or a single-frame trajectory.")
         x0 = x0[[0] * num_samples]
-    configured_sampler = sampler_from_preset(sampler, mode="equilibrium")
+    configured_sampler = sampler_from_preset(sampler, mode="equilibrium",
+                                            sampler_params=sampler_params)
     if not model.supports_propagation:
         raise ValueError("The loaded checkpoint does not support propagation.")
     msa = get_msa(system)

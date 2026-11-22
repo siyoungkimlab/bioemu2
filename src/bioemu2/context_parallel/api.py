@@ -431,6 +431,7 @@ def _embed_and_sample(
                     contacts=contacts,
                     out=out,
                     physicality_filter=physicality_mode,
+                    potentials=getattr(configured, "potentials", None),
                 )
             except (OSError, ValueError, RuntimeError) as error:
                 cause = error
