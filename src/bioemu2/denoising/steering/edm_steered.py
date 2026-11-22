@@ -95,6 +95,10 @@ def edm_steered_sampler(
     resampling_group_size: int | None = None,
     fk_lambda: float = 4.0,
     num_gd_steps: int = 20,
+    max_step: float | None = None,
+    langevin_kT: float | None = None,
+    langevin_weight: float | None = None,
+    langevin_t_on: float = 1.0,
     tracker: Tracker | None = None,
     denoise_micro_batch_size: int | None = None,
 ) -> BatchAllAtomStructure:
@@ -130,6 +134,15 @@ def edm_steered_sampler(
     denoising step. These ``cp_sync`` calls are no-ops during single-device
     sampling.
 
+    ``langevin_kT`` (kcal/mol) turns each guidance step from plain descent into an
+    unadjusted Langevin step, ``x0_hat <- x0_hat - grad + sqrt(2 * w * kT) * xi``
+    with ``w = langevin_weight`` and ``xi`` standard normal per atom coordinate, for
+    ``t <= langevin_t_on``. Descent alone drives every particle into its nearest
+    minimum; the noise lets it sample exp(-E/kT) instead, for the terms whose
+    guidance weight is ``w`` (terms at another weight see a temperature scaled by
+    ``w / their weight``). ``max_step`` caps only the gradient part. The FK
+    likelihood correction uses the gradient (drift) part of the update only.
+
     Pass a ``tracker`` to save ``x_t``, ``x0_hat``, and per-potential energies
     before resampling, or ``None`` to disable tracking. Coordinates are in
     angstroms and recorded every step, with ``x0_hat`` saved after guidance.
@@ -142,6 +155,14 @@ def edm_steered_sampler(
         potentials=potentials,
         resampling_interval=resampling_interval,
         resampling_group_size=resampling_group_size,
+    )
+    if langevin_kT is not None:
+        if not langevin_kT > 0:
+            raise ValueError("langevin_kT must be positive (kcal/mol) or None")
+        if langevin_weight is None or not langevin_weight > 0:
+            raise ValueError("langevin_kT needs a positive langevin_weight (the guidance weight w)")
+    langevin_std = (
+        math.sqrt(2.0 * langevin_weight * langevin_kT) if langevin_kT is not None else 0.0
     )
     context = score_model.compute_static_context(batch, trunk_embeddings, multiplicity)
     is_ito = context.is_dynamics_conditioned is not None and bool(
@@ -305,6 +326,15 @@ def edm_steered_sampler(
             if is_rank0:
                 coords_unpad = x0_hat.detach()
                 update = torch.zeros_like(coords_unpad)
+                drift = torch.zeros_like(coords_unpad)  # gradient part only, for the FK correction
+                langevin_now = langevin_std > 0 and t_norm <= langevin_t_on
+                if langevin_now:
+                    # Real atoms only: padding stays where the model put it.
+                    real = (
+                        atom_mask[..., None].to(coords_unpad.dtype)
+                        if atom_mask.shape == coords_unpad.shape[:-1]
+                        else torch.ones_like(coords_unpad[..., :1])
+                    )
                 for guidance_step in range(num_gd_steps):
                     # Potentials active this inner step (guidance-weight + interval gate).
                     active = []
@@ -334,9 +364,19 @@ def edm_steered_sampler(
                     grad = _micro_batch_apply(
                         _grad, coords_unpad + update, denoise_micro_batch_size
                     )
+                    if max_step is not None:
+                        # Per-atom trust region: no atom moves more than max_step
+                        # in one guidance step. Direction is kept, so fixed points
+                        # are too; stiff bonds just cannot overshoot.
+                        norm = grad.norm(dim=-1, keepdim=True)
+                        grad = grad * (max_step / norm.clamp_min(1e-12)).clamp(max=1.0)
+                    drift = (drift - grad).detach()
                     update = (update - grad).detach()
+                    if langevin_now:
+                        # Unadjusted Langevin: thermal kick of sqrt(2 w kT) per coordinate.
+                        update = update + langevin_std * real * torch.randn_like(update)
                 x0_hat = x0_hat + update
-                scaled_guidance_update = update * (
+                scaled_guidance_update = drift * (
                     -step_scale * (sigma_t_v - t_hat) / max(t_hat, 1e-12)
                 )
             x0_hat = cp_sync.broadcast_from_rank0(x0_hat.contiguous())

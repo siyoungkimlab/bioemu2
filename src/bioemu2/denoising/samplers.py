@@ -94,6 +94,21 @@ class GuidedFKSampler(Sampler):
         resampling_interval: Steps between systematic resamples. ``None``
             disables both FK weight computation and resampling (guidance only).
         num_gd_steps: Gradient-descent guidance steps on ``x0_hat`` per denoising step.
+        max_step: Largest displacement of any atom in one guidance step, in
+            angstrom; ``None`` (default) leaves steps uncapped. A cap shortens a
+            step without turning it, so the structures the guidance converges to
+            are unchanged, but stiff terms (bonds at gw * k > 1) can no longer
+            overshoot -- which lets the weights rise together without breaking
+            molecules.
+        langevin_kT: Thermal energy in kcal/mol (0.593 at 298 K) for Langevin
+            guidance; ``None`` (default) keeps plain gradient descent. Each
+            guidance step adds ``sqrt(2 * langevin_weight * langevin_kT)``
+            angstrom of Gaussian noise per atom coordinate, so particles sample
+            exp(-E/kT) of the terms guided at ``langevin_weight`` instead of
+            sliding into the nearest minimum.
+        langevin_weight: The guidance weight ``w`` the noise is matched to;
+            required with ``langevin_kT``.
+        langevin_t_on: Noise only for t <= this (1.0 = whenever guidance runs).
     """
 
     num_steps: int = 200
@@ -104,9 +119,22 @@ class GuidedFKSampler(Sampler):
     resampling_group_size: int | None = None
     fk_lambda: float = 4.0
     num_gd_steps: int = 20
+    max_step: float | None = None
+    langevin_kT: float | None = None
+    langevin_weight: float | None = None
+    langevin_t_on: float = 1.0
 
     def __post_init__(self) -> None:
         _validate_edm_scales(self.step_scale, self.noise_scale)
+        if self.max_step is not None and not self.max_step > 0:
+            raise ValueError("max_step must be positive (angstrom) or None")
+        if self.langevin_kT is not None:
+            if not self.langevin_kT > 0:
+                raise ValueError("langevin_kT must be positive (kcal/mol) or None")
+            if self.langevin_weight is None or not self.langevin_weight > 0:
+                raise ValueError("langevin_kT needs a positive langevin_weight")
+        if not 0.0 <= self.langevin_t_on <= 1.0:
+            raise ValueError("langevin_t_on must be in [0, 1]")
 
     def __call__(
         self,
