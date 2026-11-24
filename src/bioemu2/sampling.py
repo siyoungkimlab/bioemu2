@@ -73,20 +73,29 @@ def _apply_sampler_params(sampler: Sampler, params: dict | None) -> Sampler:
     return sampler
 
 
-#: Physicality potentials the ligand presets leave out: they hold bond and angle
-#: geometry at 10-50x the force field's own weights, so they override the terms
-#: the ligand force field provides.
-_LIGAND_PRESET_DROP = ("PoseBustersPotential", "BondLengthPotential", "BondAnglePotential")
+#: Physicality potentials the ligand presets leave out: BondLength and BondAngle
+#: hold bond and angle geometry at 10-50x the force field's own weights, so they
+#: override the terms the ligand force field provides.
+#:
+#: PoseBusters is KEPT. It is not a competing restraint but a guard rail: a flat
+#: bottom on RDKit's distance bounds, so within +-20% of a bond's bound it exerts
+#: no force at all and the force field alone decides the geometry. Without it,
+#: 30-46% of generated structures carry a bond more than 10% off its MD value,
+#: the worst reaching 52%, and the biaryls' exocyclic C-O bonds average 17% off.
+#: It costs nothing where the force field is already right, and bounds the gross
+#: failures where it is not.
+_LIGAND_PRESET_DROP = ("BondLengthPotential", "BondAnglePotential")
 
 
 def _drop_overriding_physicality(potentials):
-    """The preset's potentials without the three that override the ligand force field."""
+    """The preset's potentials without the ones that override the ligand force field."""
     return tuple(p for p in potentials if type(p).__name__ not in _LIGAND_PRESET_DROP)
 
 
 def _ligand_sampler_kw() -> dict:
     """Sampler settings shared by the ligand force-field presets."""
     from bioemu2.denoising.steering.potentials import (
+        LIGAND_STEER_GD_STEPS,
         LIGAND_STEER_LANGEVIN_KT,
         LIGAND_STEER_LANGEVIN_WEIGHT,
         LIGAND_STEER_PARTICLES_PER_SAMPLE,
@@ -98,6 +107,11 @@ def _ligand_sampler_kw() -> dict:
         "langevin_weight": LIGAND_STEER_LANGEVIN_WEIGHT,
         "langevin_t_on": LIGAND_STEER_T_ON,
         "particles_per_sample": LIGAND_STEER_PARTICLES_PER_SAMPLE,
+        # One independent resampling group per output sample, rather than None,
+        # which resamples the whole batch as a single pool. Re-derived from the
+        # final k in sampler_from_preset, after sampler_params are applied.
+        "resampling_group_size": LIGAND_STEER_PARTICLES_PER_SAMPLE,
+        "num_gd_steps": LIGAND_STEER_GD_STEPS,
     }
 
 
@@ -113,6 +127,7 @@ def _ligand_potential_kw(preset: str) -> dict:
         LIGAND_STEER_ANGLE_WEIGHT,
         LIGAND_STEER_BOND_WEIGHT,
         LIGAND_STEER_NONBONDED_WEIGHT,
+        LIGAND_STEER_NONBONDED_WEIGHT_DEFAULT,
         LIGAND_STEER_PAIR14_WEIGHT,
         LIGAND_STEER_T_ON,
         LIGAND_STEER_TORSION_WEIGHT,
@@ -126,7 +141,8 @@ def _ligand_potential_kw(preset: str) -> dict:
         "angle_weight": LIGAND_STEER_ANGLE_WEIGHT,
         "torsion_weight": LIGAND_STEER_TORSION_WEIGHT,
         "pair14_weight": LIGAND_STEER_PAIR14_WEIGHT,
-        "nonbonded_weight": LIGAND_STEER_NONBONDED_WEIGHT.get(preset, 0.0075),
+        "nonbonded_weight": LIGAND_STEER_NONBONDED_WEIGHT.get(
+            preset, LIGAND_STEER_NONBONDED_WEIGHT_DEFAULT),
     }
     if preset != "mmff":
         kw |= {"bond_uniform_k": False, "angle_uniform_k": False, "angle_cutoff": 0.35}
@@ -184,7 +200,18 @@ def sampler_from_preset(
         if not isinstance(sampler, GuidedFKSampler | FKCSampler):
             raise ValueError("potentials requires a steering sampler (edm_gd, edm_fk, edm_fkc)")
         sampler.potentials = tuple(potentials)
-    return _apply_sampler_params(sampler, sampler_params)
+    sampler = _apply_sampler_params(sampler, sampler_params)
+    # The force-field presets resample within each output sample, so the group
+    # is sized from the FINAL k: -S particles_per_sample=N gives groups of N,
+    # not groups of the preset's 3. An explicit resampling_group_size wins,
+    # including None for one pool over the whole batch. Below k = 2 there is
+    # nothing to select between, so leave the sampler's own None. Every other
+    # preset keeps its own defaults untouched.
+    if (preset == "mmff" or preset in GAFF_PRESETS) and not (
+            sampler_params or {}).keys() & {"resampling_group_size"}:
+        k = max(1, int(getattr(sampler, "particles_per_sample", 1) or 1))
+        sampler.resampling_group_size = k if k >= 2 else None
+    return sampler
 
 
 def warn_batch_size(num_tokens: int, num_samples: int, batch_size: int) -> None:

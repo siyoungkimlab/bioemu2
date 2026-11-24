@@ -298,32 +298,85 @@ MMFF_WEIGHT = 0.0005
 GAFF2_WEIGHT = 0.0005
 
 #: The per-term weights the ligand presets steer with, measured on a 15-ligand
-#: benchmark against 30 ns of GAFF2 and OpenFF MD. Bonds and angles are held
-#: an order of magnitude below the terms that decide conformation, because the
-#: bonded terms are what the guidance distorts when it is pushed; torsion and
-#: nonbonded carry the conformational preference.
-LIGAND_STEER_BOND_WEIGHT = 0.001
-LIGAND_STEER_ANGLE_WEIGHT = 0.001
-LIGAND_STEER_PAIR14_WEIGHT = 0.001
-LIGAND_STEER_TORSION_WEIGHT = 0.005
-#: The nonbonded weight differs by force field: 0.0075 was better for MMFF and
-#: OpenFF (MMFF 4.0 -> 0.4% wrong torsion states, OpenFF 15.9 -> 5.0%), while
-#: GAFF2 was a wash and keeps the more reproducible 0.005.
-LIGAND_STEER_NONBONDED_WEIGHT = {"gaff2": 0.005, "mmff": 0.0075}
+#: benchmark against 30 ns of GAFF2 MD (2026-11-23). The earlier values were
+#: tuned against force magnitudes and pass rates; these are tuned against MD
+#: geometry.
+#:
+#: Guidance is fixed-step gradient descent on the weighted energy, so a weight
+#: IS that term's step length, not a strength. Descent on a bond of force
+#: constant k diverges once w * 8k > 2, i.e. w* = 0.00038 for a GAFF2 C=O and
+#: 0.00027 for an MMFF one, so the previous bond/angle 0.001 was past the bound
+#: for every bond but sp3 C-C and was held together only by the Huber cutoff.
+#: The damage sorted by force constant, not by molecule: at bond/angle 0.00125,
+#: benzene reached 80.6% bad bonds while the three pure-sp3 rings stayed at
+#: 0.00%.
+#:
+#: Bond, angle and torsion are a quarter of the earlier set. A uniform scale
+#: preserves the ratios -- the fixed point of sum_i w_i grad U_i = 0, and so the
+#: target geometry -- and shrinks only the step; scaling bond, or bond+angle,
+#: ALONE measured worse than the old default, because the ratio is what sets the
+#: geometry. pair14 is raised to the torsion weight because the benchmark held
+#: the three soft terms together at 0.00125.
+#:
+#: Measured over 14 molecules x 3 seeds x 840 frames: bad bonds 6.3% -> 0.00%,
+#: bond deviation 4.5% -> 2.0% against MD's own 1.6% floor, ring pucker Q 0.465
+#: against MD's 0.459.
+LIGAND_STEER_BOND_WEIGHT = 0.00025
+LIGAND_STEER_ANGLE_WEIGHT = 0.00025
+LIGAND_STEER_PAIR14_WEIGHT = 0.00125
+LIGAND_STEER_TORSION_WEIGHT = 0.00125
+
+#: Held at the torsion weight for every preset, OpenFF included through the
+#: fallback. That is a uniform quarter of GAFF2's old 0.005 but only a sixth of
+#: MMFF's old 0.0075, so MMFF's nonbonded term is driven 1.5x less than a
+#: uniform rescale of its own preset would give. This value is the tested one
+#: (0.04-0.05% bad bonds under MMFF); the uniform-quarter alternative for MMFF,
+#: 0.001875, has not been run.
+LIGAND_STEER_NONBONDED_WEIGHT = {"gaff2": 0.00125, "mmff": 0.00125}
+LIGAND_STEER_NONBONDED_WEIGHT_DEFAULT = 0.00125
 
 #: Guidance applies only below this diffusion time: torsions are decided around
 #: t = 0.3-0.15, and steering earlier fights the model while the ligand is still
 #: forming.
 LIGAND_STEER_T_ON = 0.4
 
-#: Langevin guidance: x0 <- x0 - sum w grad E + sqrt(2 w kT) xi. kT is room
-#: temperature in kcal/mol. Plain descent drives every particle into the nearest
-#: minimum and tears stiff bonds; the noise lets it leave a bad basin.
+#: Langevin guidance: x0 <- x0 - sum w grad E + sqrt(2 w kT) xi, with kT at
+#: room temperature in kcal/mol. The kick is added once per descent step, INSIDE
+#: the inner loop, so the noise accumulates as sqrt(N) while the drift
+#: accumulates linearly: at LIGAND_STEER_GD_STEPS this weight is about 0.39 A of
+#: thermal displacement, where the old 0.005 would be 0.77 A.
+#:
+#: This is a trade, not an ordering. Measured at bond/angle 0.00025, gd 80,
+#: as bioemu2 / boltz1:
+#:
+#:   langevin   bad bonds       pucker Q (MD 0.459)   boltz1 mean |dtors|
+#:   0.005      0.27% / 0.60%   0.311 / 0.331         10.0 deg
+#:   0.00125    0.00% / 0.00%   0.460 / 0.465         20.4 deg
+#:
+#: The cooler value is the default because it is the one that leaves bonds and
+#: ring geometry intact; raise it to 0.005 when conformational spread matters
+#: more than bond lengths. One counterintuitive detail: where the descent is
+#: ALREADY unstable, more noise does less bond damage (19.8% vs 45.7% at bond
+#: 0.00125), because the kick decoheres the overshoot instead of compounding it.
 LIGAND_STEER_LANGEVIN_KT = 0.593
-LIGAND_STEER_LANGEVIN_WEIGHT = 0.005
+LIGAND_STEER_LANGEVIN_WEIGHT = 0.00125
 
-#: Particles carried per requested sample; see particles_per_sample.
-LIGAND_STEER_PARTICLES_PER_SAMPLE = 5
+#: Particles carried per requested sample, and also the size of each independent
+#: resampling group: the presets set the group size TO this value, so each output
+#: sample's particles compete only with each other instead of in one global pool
+#: over the whole batch. A single global pool measured better at large pool
+#: sizes, but the benchmarked setting is k = 3 grouped, which keeps the cost per
+#: sample fixed and still carries the FK selection.
+LIGAND_STEER_PARTICLES_PER_SAMPLE = 3
+
+#: Inner gradient-descent steps per diffusion step. The gradient is re-evaluated
+#: at the displaced geometry on every iteration, so this is genuine iterative
+#: descent, and the soft terms need the steps that the x0.25 weights cost them:
+#: it is w * steps that reaches a fixed point. 80 and 20 were benchmarked -- in
+#: boltz1 they tie, in bioemu2 20 loses the open conformers (bipyridine N-C-C-N
+#: 122 deg -> 45, against MD's 166). 100 extrapolates the better of the two and
+#: is NOT itself benchmarked.
+LIGAND_STEER_GD_STEPS = 100
 
 class ParameterSchedule(ABC):
     def compute(self, t: float) -> float:
@@ -1675,6 +1728,88 @@ class MMFFNonbondedPotential(HydrogenMixin, MMFFPotential):
         return (vdw + coul).sum(dim=-1)
 
 
+#: Default late stage for a two-stage bond/angle weight: the last quarter of
+#: the guided window (t_on 0.4 -> 0.1).
+LIGAND_BOND_ANGLE_LATE_T_ON = 0.1
+
+#: Resolved lazily: these classes are defined further down this module than
+#: the factories that call the helper below.
+def _late_types():
+    return ((GAFFBondPotential, MMFFBondPotential),
+            (GAFFAnglePotential, MMFFAnglePotential))
+
+
+def _apply_late_bond_angle(terms, t_on, late_t_on, late_bond, late_angle) -> None:
+    """Raise the bond and angle GUIDANCE weights for t <= late_t_on.
+
+    Bond and angle are stiff, local and nearly convex, so clamping them hard
+    only at the end -- once the torsions that decide chemical state have
+    settled, and with little noise left to wash the correction out -- pulls
+    back the bond stretch a large 1-4 weight induces without disturbing the
+    conformation that weight was raised to get.
+
+    Resampling weights are deliberately left alone: changing the Feynman-Kac
+    reward partway through a run would reweight particles against a different
+    objective than the one they were grown under.
+    """
+    bond_types, angle_types = _late_types()
+    for p in terms:
+        if isinstance(p, bond_types):
+            late = late_bond
+        elif isinstance(p, angle_types):
+            late = late_angle
+        else:
+            continue
+        if late is None:
+            continue
+        params = dict(p.parameters or {})
+        early = params.get("guidance_weight")
+        if early is None:
+            continue
+        if isinstance(early, PiecewiseStepFunction):
+            # _apply_t_on already made a step at t_on; rebuild from its value.
+            early = early.values[0]
+        elif not isinstance(early, (int, float)):
+            raise ValueError(
+                "a late bond/angle weight needs a plain weight to start from, "
+                f"got {type(early).__name__}"
+            )
+        thresholds = [late_t_on] if t_on is None else [late_t_on, t_on]
+        values = [late, early] if t_on is None else [late, early, 0.0]
+        params["guidance_weight"] = PiecewiseStepFunction(
+            thresholds=thresholds, values=values
+        )
+        p.parameters = params
+
+
+def _late_stage(t_on, guidance_ramp, bond_angle_late_weight,
+                bond_late_weight, angle_late_weight, bond_angle_late_t_on):
+    """(late_t_on, late_bond, late_angle), or None when no late stage is asked
+    for. Validates the stage against t_on and guidance_ramp."""
+    late_bond = (
+        bond_late_weight if bond_late_weight is not None else bond_angle_late_weight
+    )
+    late_angle = (
+        angle_late_weight if angle_late_weight is not None else bond_angle_late_weight
+    )
+    if late_bond is None and late_angle is None:
+        return None
+    late_t_on = bond_angle_late_t_on
+    if late_t_on is None:
+        late_t_on = LIGAND_BOND_ANGLE_LATE_T_ON
+    if guidance_ramp:
+        raise ValueError(
+            "guidance_ramp replaces the whole guidance schedule; it cannot be "
+            "combined with a late bond/angle weight"
+        )
+    if t_on is not None and late_t_on >= t_on:
+        raise ValueError(
+            f"bond_angle_late_t_on ({late_t_on}) must be below t_on ({t_on}); "
+            "the late stage is the tail of the guided window, not all of it"
+        )
+    return late_t_on, late_bond, late_angle
+
+
 def get_mmff_potentials(
     *, angle: bool = True, torsion: bool = True, bond: bool = True,
     pairs14: bool = True,
@@ -1737,6 +1872,12 @@ def get_mmff_potentials(
     nonbonded_t_on: float | None = None,
     # Guidance weight w * (1 - t) instead of the t_on switch (resampling keeps it).
     guidance_ramp: bool = False,
+    # Two-stage bond/angle guidance: the weight above holds for
+    # bond_angle_late_t_on < t <= t_on, then these for t <= late_t_on.
+    bond_angle_late_weight: float | None = None,
+    bond_late_weight: float | None = None,
+    angle_late_weight: float | None = None,
+    bond_angle_late_t_on: float | None = None,
 ) -> Sequence[Potential]:
     """The default potentials plus the requested MMFF ligand terms.
 
@@ -1847,6 +1988,11 @@ def get_mmff_potentials(
         planar_weight=planar_weight,
     ) if physicality else ()
     _apply_t_on(extra, t_on, nonbonded_t_on, guidance_ramp)
+    _late = _late_stage(t_on, guidance_ramp, bond_angle_late_weight,
+                        bond_late_weight, angle_late_weight,
+                        bond_angle_late_t_on)
+    if _late is not None:
+        _apply_late_bond_angle(extra, t_on, *_late)
     _share_hydrogen_group(extra)
     return (*defaults, *extra)
 
@@ -2468,6 +2614,12 @@ def get_gaff_potentials(
     nonbonded_t_on: float | None = None,
     # Guidance weight w * (1 - t) instead of the t_on switch (resampling keeps it).
     guidance_ramp: bool = False,
+    # Two-stage bond/angle guidance: the weight above holds for
+    # bond_angle_late_t_on < t <= t_on, then these for t <= late_t_on.
+    bond_angle_late_weight: float | None = None,
+    bond_late_weight: float | None = None,
+    angle_late_weight: float | None = None,
+    bond_angle_late_t_on: float | None = None,
     # The ligand force field the terms are parameterized with: "gaff2", or an
     # OpenFF release such as "openff-2.2.1" (same functional forms).
     ligand_ff: str = "gaff2",
@@ -2572,6 +2724,11 @@ parameters={
         if isinstance(p, GAFFPotential):
             p.ligand_ff = ligand_ff
     _apply_t_on(extra, t_on, nonbonded_t_on, guidance_ramp)
+    _late = _late_stage(t_on, guidance_ramp, bond_angle_late_weight,
+                        bond_late_weight, angle_late_weight,
+                        bond_angle_late_t_on)
+    if _late is not None:
+        _apply_late_bond_angle(extra, t_on, *_late)
     _share_hydrogen_group(extra)
     return (*defaults, *extra)
 

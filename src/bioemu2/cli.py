@@ -34,6 +34,8 @@ from bioemu2.physicality import PhysicalityFilterMode, PhysicalityReport
 from bioemu2.propagation import propagate, propagate_with_embeddings
 from bioemu2.sampling import (
     SamplerPreset,
+    _drop_overriding_physicality,
+    _ligand_potential_kw,
     check_physicality,
     expected_extra_bonds_from_system,
     predict_structure,
@@ -75,25 +77,44 @@ _FORCEFIELD_PRESETS = ("mmff", "gaff2", "openff-2.2.1")
 #: Presets built from get_gaff_potentials; the name is the ligand force field.
 _GAFF_PRESETS = ("gaff2", "openff-2.2.1")
 
-#: What --sampler gaff2 builds, mirroring the preset in sampling.py so an -F
-#: override can be merged over it instead of over the factory's plain GAFF
-#: defaults (uniform_k=True, nonbonded=False). Kept here rather than
-#: duplicated: _gaff2_preset_kw() reads GAFF2_WEIGHT at call time.
-def _gaff2_preset_kw() -> dict:
-    from bioemu2.denoising.steering.potentials import GAFF2_WEIGHT
+#: -P drop_overriding=NAME says which physicality terms the ligand presets
+#: leave out. The three of them hold bond and angle geometry at 10-50x the
+#: force field's own weights, and they carry resampling_weight as well, so
+#: they steer FK selection and not only the gradient. It is not a potential
+#: parameter, so it is taken out of the -P list before the rest are parsed.
+#:
+#: bond_angle (the default, and what _LIGAND_PRESET_DROP ships) keeps
+#: PoseBusters as a guard rail -- a flat bottom on RDKit's distance bounds,
+#: no force within +-20% of a bound -- while dropping the two that compete
+#: with the force field outright.
+_DROP_OVERRIDING_SETS: dict[str, tuple[str, ...]] = {
+    "none": (),
+    "bond_angle": ("BondLengthPotential", "BondAnglePotential"),
+    "all": ("PoseBustersPotential", "BondLengthPotential",
+            "BondAnglePotential"),
+}
+_DROP_OVERRIDING_KEY = "drop_overriding"
 
-    return {
-        "hydrogen": True,
-        "bond_uniform_k": False,
-        "angle_uniform_k": False,
-        "angle_cutoff": 0.35,
-        "nonbonded": True,
-        "bond_weight": GAFF2_WEIGHT,
-        "angle_weight": GAFF2_WEIGHT,
-        "torsion_weight": GAFF2_WEIGHT,
-        "pair14_weight": GAFF2_WEIGHT,
-        "nonbonded_weight": GAFF2_WEIGHT,
-    }
+
+def _split_drop_overriding(
+    values: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...] | None]:
+    """``("drop_overriding=all",)`` -> ``((), the three class names)``."""
+    rest: list[str] = []
+    drop: tuple[str, ...] | None = None
+    for item in values:
+        key, sep, raw = item.partition("=")
+        if key.strip() != _DROP_OVERRIDING_KEY:
+            rest.append(item)
+            continue
+        token = raw.strip().lower()
+        if not sep or token not in _DROP_OVERRIDING_SETS:
+            raise ValueError(
+                f"--potential-param {_DROP_OVERRIDING_KEY} takes one of "
+                f"{', '.join(_DROP_OVERRIDING_SETS)}; got {raw.strip()!r}"
+            )
+        drop = _DROP_OVERRIDING_SETS[token]
+    return tuple(rest), drop
 
 
 
@@ -106,7 +127,10 @@ _SAMPLER_FIELDS: dict[str, str] = {
     "step_scale": "edm, edm_gd, edm_fk",
     "noise_scale": "edm, edm_gd, edm_fk",
     "resampling_interval": "edm_gd, edm_fk, edm_fkc (none disables)",
-    "resampling_group_size": "edm_gd, edm_fk, edm_fkc",
+    "resampling_group_size": "edm_gd, edm_fk, edm_fkc (particles per independent "
+                             "group; none = one pool over the whole batch. The "
+                             "ligand force-field presets default to k, one group "
+                             "per output sample)",
     "fk_lambda": "edm_gd, edm_fk",
     "num_gd_steps": "edm_gd, edm_fk",
     "max_step": "edm_gd, edm_fk (A per atom per guidance step; none = uncapped)",
@@ -114,7 +138,7 @@ _SAMPLER_FIELDS: dict[str, str] = {
     "langevin_weight": "edm_gd, edm_fk (guidance weight w of the noise sqrt(2 w kT))",
     "langevin_t_on": "edm_gd, edm_fk (Langevin noise only for t <= this)",
     "particles_per_sample": "edm_gd, edm_fk (particles carried per requested sample; "
-                            "--num-samples still sets how many are written. 5 for the "
+                            "--num-samples still sets how many are written. 3 for the "
                             "ligand force-field presets, 1 otherwise)",
     "ess_threshold": "edm_fkc",
     "beta_power": "edm_fkc",
@@ -198,6 +222,12 @@ _FORCEFIELD_PARAMS: dict[str, str] = {
     "t_on": "t_on",
     # Guidance weight ramps linearly from 0 at t = 1 to its value at t = 0.
     "guidance.ramp": "guidance_ramp",
+    # Two-stage bond/angle guidance: bond.weight / angle.weight hold for
+    # bond_angle.late_t_on < t <= t_on, then these for t <= late_t_on.
+    "bond_angle.late_weight": "bond_angle_late_weight",
+    "bond.late_weight": "bond_late_weight",
+    "angle.late_weight": "angle_late_weight",
+    "bond_angle.late_t_on": "bond_angle_late_t_on",
 }
 
 #: Keys that select a term's force constants rather than scale it.
@@ -303,7 +333,7 @@ def _parse_forcefield_params(values: tuple[str, ...],
             raise ValueError(f"--forcefield-param {key} must not be negative")
         if key.endswith("dielectric") and v == 0.0:
             raise ValueError(f"--forcefield-param {key} must be positive")
-        if key in ("nonbonded.t_on", "t_on") and v > 1.0:
+        if key in ("nonbonded.t_on", "t_on", "bond_angle.late_t_on") and v > 1.0:
             raise ValueError(f"--forcefield-param {key} is a diffusion time in [0, 1]")
         out[_FORCEFIELD_PARAMS[key]] = v
     # The factory builds the nonbonded term only when nonbonded is
@@ -392,6 +422,7 @@ def _load_potentials(preset: str, path: Path | None,
                      params: tuple[str, ...] = (),
                      ff_params: tuple[str, ...] = (),
                      ) -> Sequence[Potential] | None:
+    params, drop_overriding = _split_drop_overriding(params)
     overrides = _parse_potential_params(params)
     # Which factory the flags are headed for decides what all.weight
     # expands to: GAFF has no stretch-bend term.
@@ -410,7 +441,7 @@ def _load_potentials(preset: str, path: Path | None,
             f"(mmff, gaff2); --sampler {preset} carries no force field"
         )
     if path is None:
-        if not overrides and not ff:
+        if not overrides and not ff and drop_overriding is None:
             return None          # unchanged: the sampler uses its own default
         if preset not in _STEERING_PRESETS:
             raise ValueError(
@@ -418,27 +449,38 @@ def _load_potentials(preset: str, path: Path | None,
                 f"edm_fk, edm_fkc); --sampler {preset} is unsteered, so it "
                 "has no potentials to configure"
             )
-        # The shipped set with the named parameters replaced; everything else
-        # keeps its default, so this equals the preset's own potentials when
-        # nothing is overridden.
+        # The preset's own potentials with the named parameters replaced, so
+        # an -F/-P flag changes ONLY what it names. Both the weights and the
+        # drop come from sampling.py, the single source of truth: a second
+        # copy of the weights here silently reset every unnamed term to the
+        # pre-retuning GAFF2_WEIGHT (0.0005) and skipped the drop, so -F also
+        # restored the three overriding physicality terms. Measured: the same
+        # nonbonded weight scored 77.8% vs 12.2% bad bonds depending only on
+        # whether an unrelated -F flag was present.
         # mmff carries ligand terms as well, and get_mmff_potentials
         # forwards the physicality parameters, so -P applies to both.
         if preset == "mmff":
-            # hydrogen defaults on here but an -F override wins,
-            # so merge rather than pass it explicitly.
-            kw = {"hydrogen": True, **overrides, **ff}
-            return tuple(get_mmff_potentials(**kw))
-        if preset in _GAFF_PRESETS:
-            # Same merge, over the gaff2 preset's own defaults: without them
-            # an -F flag would fall back to the factory's GAFF defaults,
-            # which are uniform_k=True and nonbonded=False -- not gaff2.
+            kw = {**_ligand_potential_kw("mmff"), **overrides, **ff}
+            potentials = tuple(get_mmff_potentials(**kw))
+        elif preset in _GAFF_PRESETS:
             # openff-2.2.1 is the same preset with OpenFF's parameters.
             from bioemu2.denoising.steering.potentials import (
                 get_gaff_potentials,
             )
-            kw = {**_gaff2_preset_kw(), "ligand_ff": preset, **overrides, **ff}
-            return tuple(get_gaff_potentials(**kw))
-        return tuple(get_default_potentials(**overrides))
+            kw = {**_ligand_potential_kw(preset), "ligand_ff": preset,
+                  **overrides, **ff}
+            potentials = tuple(get_gaff_potentials(**kw))
+        else:
+            # Not a ligand preset, so there is nothing to drop.
+            return tuple(get_default_potentials(**overrides))
+        if drop_overriding is None:
+            # Unset: exactly what the preset does, via sampling.py's own set.
+            return _drop_overriding_physicality(potentials)
+        # Explicit: filter here rather than through
+        # _drop_overriding_physicality, which closes over _LIGAND_PRESET_DROP
+        # and would ignore the chosen set.
+        return tuple(p for p in potentials
+                     if type(p).__name__ not in drop_overriding)
     if overrides:
         raise ValueError(
             "--potentials replaces the physicality set entirely, so it cannot "
@@ -847,7 +889,9 @@ def _write_parameters(out: Path, sampler) -> None:
                          + (f"        # {'; '.join(notes)}" if notes else ""))
         for attr in ("uniform_k", "use_hydrogens", "cutoff", "sigma_tolerance",
                      "lj_core_switch", "coulomb_core_switch", "dielectric", "t_on",
-                     "nonbonded_t_on", "guidance_ramp", "ligand_ff"):
+                     "nonbonded_t_on", "guidance_ramp", "ligand_ff",
+                     "bond_angle_late_weight", "bond_late_weight",
+                     "angle_late_weight", "bond_angle_late_t_on"):
             if hasattr(p, attr):
                 cli = ff_key.get(attr, "")
                 lines.append(f"      {attr}: {getattr(p, attr)!r}"
